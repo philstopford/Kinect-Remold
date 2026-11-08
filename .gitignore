@@ -1,4 +1,9 @@
-/binaries
-.idea/*
-applications/processing/SynKinectStudio/data/skeleton/movenet.onnx
-applications/processing/SynKinectStudio/data/skeleton/rtmpose-hand.onnx
+# Generated build and packaged runtime output
+/binaries/
+
+# Studio build stages verified model downloads here; source models are not committed.
+/applications/processing/SynKinectStudio/data/skeleton/*.onnx
+/applications/processing/SynKinectStudio/data/skeleton/*.task
+
+# Local IDE state
+/.idea/
