@@ -251,6 +251,11 @@ HAND_MODEL_CACHED="$(fetch_pinned rtmpose-hand.onnx "$REMOLD_RTMPOSE_HAND_MODEL_
 install -m 0644 "$HAND_MODEL_CACHED" "$HAND_MODEL_DEST"
 [[ "$(sha256_file "$HAND_MODEL_DEST")" == "${REMOLD_RTMPOSE_HAND_MODEL_SHA256,,}" ]] || { echo 'RTMPose Hand SHA-256 validation failed.' >&2; exit 1; }
 echo 'RTMPose RGB hand model: READY'
+FACE_MODEL_DEST="$SKETCH/data/skeleton/face_landmarker.task"
+FACE_MODEL_CACHED="$(fetch_pinned face_landmarker.task "$REMOLD_FACE_LANDMARKER_URL" "$REMOLD_FACE_LANDMARKER_SHA256")"
+install -m 0644 "$FACE_MODEL_CACHED" "$FACE_MODEL_DEST"
+[[ "$(sha256_file "$FACE_MODEL_DEST")" == "${REMOLD_FACE_LANDMARKER_SHA256,,}" ]] || { echo 'Face Landmarker SHA-256 validation failed.' >&2; exit 1; }
+echo 'MediaPipe Face Landmarker model: READY'
 
 
 

@@ -36,6 +36,12 @@ public interface StudioModuleContext {
      * activation (camera ownership) and must be closed by the module.
      */
     default StudioBodyTracking bodyTracking(String deviceId) { return null; }
+    /**
+     * Opens host-owned face capture for one RGB-D device. Face capture is intentionally
+     * single-sensor; body fusion is a separate multi-host coordinator concern.
+     * Returns null until the selected host has a compatible installed face model.
+     */
+    default StudioFaceTracking faceTracking(String deviceId) { return null; }
     Path dataDirectory() throws IOException;
     Thread runAsync(String role, Runnable task);
     void log(String message);

@@ -255,6 +255,12 @@ Copy-Item -LiteralPath $handModelSource -Destination $handModelPath -Force
 $handModelHash=(Get-FileHash -LiteralPath $handModelPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if($handModelHash -ne (Build-Setting 'REMOLD_RTMPOSE_HAND_MODEL_SHA256').ToLowerInvariant()){throw 'RTMPose Hand SHA-256 validation failed.'}
 Write-Host 'RTMPose RGB hand model: READY' -ForegroundColor Green
+$faceModelPath=Join-Path $Sketch 'data\skeleton\face_landmarker.task'
+$faceModelSource=Get-PinnedFile 'face_landmarker.task' (Build-Setting 'REMOLD_FACE_LANDMARKER_URL') (Build-Setting 'REMOLD_FACE_LANDMARKER_SHA256')
+Copy-Item -LiteralPath $faceModelSource -Destination $faceModelPath -Force
+$faceModelHash=(Get-FileHash -LiteralPath $faceModelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if($faceModelHash -ne (Build-Setting 'REMOLD_FACE_LANDMARKER_SHA256').ToLowerInvariant()){throw 'Face Landmarker SHA-256 validation failed.'}
+Write-Host 'MediaPipe Face Landmarker model: READY' -ForegroundColor Green
 
 
 

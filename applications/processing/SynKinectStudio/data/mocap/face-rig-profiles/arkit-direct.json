@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "arkit-direct",
+  "controls": [
+    {"source": "jawOpen", "target": "jawOpen"},
+    {"source": "eyeBlinkLeft", "target": "eyeBlinkLeft"},
+    {"source": "eyeBlinkRight", "target": "eyeBlinkRight"},
+    {"source": "mouthSmileLeft", "target": "mouthSmileLeft"},
+    {"source": "mouthSmileRight", "target": "mouthSmileRight"}
+  ]
+}

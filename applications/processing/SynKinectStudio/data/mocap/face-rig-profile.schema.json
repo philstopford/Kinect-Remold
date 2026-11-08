@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SynKinect facial rig profile",
+  "description": "Maps canonical ARKit-52 coefficients to an avatar's named facial controls. This profile never changes source capture values.",
+  "type": "object",
+  "required": ["version", "id", "controls"],
+  "properties": {
+    "version": {"const": 1},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+    "controls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "target"],
+        "properties": {
+          "source": {"type": "string", "description": "One StudioFaceBlendshape.ARKIT_52 name"},
+          "target": {"type": "string", "description": "Avatar blendshape or bone-control name"},
+          "scale": {"type": "number", "default": 1.0},
+          "offset": {"type": "number", "default": 0.0},
+          "clamp": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "default": [0, 1]}
+        }
+      }
+    }
+  }
+}
