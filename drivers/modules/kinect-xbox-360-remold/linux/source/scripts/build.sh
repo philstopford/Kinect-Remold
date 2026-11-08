@@ -95,11 +95,15 @@ build_dependency_report(){
 
   kernel_build="$(remold_kernel_build_dir "$(uname -r)" 2>/dev/null || true)"
   [[ -n "$kernel_build" && -r "$kernel_build/Makefile" ]] || missing+=("kernel-headers:$(uname -r)")
+  if [[ -n "$kernel_build" ]] && grep -qs '^CONFIG_CC_IS_CLANG=y' \
+      "$kernel_build/include/config/auto.conf" "$kernel_build/.config" 2>/dev/null; then
+    remold_find_command clang >/dev/null 2>&1 || missing+=("command:clang (required by the Clang-built kernel)")
+  fi
 
   if remold_find_command pkg-config >/dev/null 2>&1; then
     pkg-config --exists libusb-1.0 || missing+=("pkg-config:libusb-1.0")
     pkg-config --exists alsa || missing+=("pkg-config:alsa")
-    pkg-config --exists opencv4 || missing+=("pkg-config:opencv4")
+    pkg-config --exists opencv5 || missing+=("pkg-config:opencv5")
   fi
 
   if ((${#missing[@]})); then
@@ -131,7 +135,7 @@ install_build_dependencies(){
   if command -v apt-get >/dev/null 2>&1; then
     run_root apt-get update
     run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      build-essential cmake pkg-config curl ca-certificates python3 cabextract msitools kmod tar \
+      build-essential clang cmake pkg-config curl ca-certificates python3 cabextract msitools kmod tar \
       systemd udev passwd \
       libusb-1.0-0-dev libasound2-dev libopencv-dev libjpeg-dev
     kernel_headers="linux-headers-$(uname -r)"
@@ -148,7 +152,7 @@ install_build_dependencies(){
   fi
   if command -v dnf >/dev/null 2>&1; then
     run_root dnf install -y \
-      gcc-c++ make cmake pkgconf-pkg-config curl ca-certificates python3 cabextract msitools kmod tar \
+      gcc-c++ clang make cmake pkgconf-pkg-config curl ca-certificates python3 cabextract msitools kmod tar \
       systemd-udev shadow-utils \
       libusb1-devel alsa-lib-devel opencv-devel libjpeg-turbo-devel
     run_root dnf install -y "kernel-devel-$(uname -r)" 2>/dev/null || true
@@ -156,7 +160,7 @@ install_build_dependencies(){
   fi
   if command -v pacman >/dev/null 2>&1; then
     run_root pacman -S --needed --noconfirm \
-      base-devel cmake pkgconf curl ca-certificates python cabextract msitools kmod tar \
+      base-devel clang cmake pkgconf curl ca-certificates python cabextract msitools kmod tar \
       systemd shadow \
       libusb alsa-lib opencv libjpeg-turbo
     kernel_root="$(remold_kernel_modules_root "$(uname -r)" 2>/dev/null || true)"

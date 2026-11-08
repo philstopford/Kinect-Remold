@@ -1,0 +1,4 @@
+/binaries
+.idea/*
+applications/processing/SynKinectStudio/data/skeleton/movenet.onnx
+applications/processing/SynKinectStudio/data/skeleton/rtmpose-hand.onnx

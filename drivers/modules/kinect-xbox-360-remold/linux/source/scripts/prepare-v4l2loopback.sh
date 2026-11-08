@@ -25,6 +25,19 @@ TARBALL="$CACHE_ROOT/$ARCHIVE"
   exit 2
 }
 
+# External modules must use the same compiler family as the kernel.  In
+# particular, Clang-built kernels expose Clang-only flags through Kbuild; its
+# default `CC=gcc` would reject those flags before the module is compiled.
+KERNEL_MAKE_ARGS=()
+if grep -qs '^CONFIG_CC_IS_CLANG=y' "$KERNEL_BUILD/include/config/auto.conf" "$KERNEL_BUILD/.config" 2>/dev/null; then
+  command -v clang >/dev/null 2>&1 || {
+    echo "Kernel $KERNEL_RELEASE was built with Clang, but clang is not installed." >&2
+    echo 'Install clang (preferably the version recorded in include/generated/compile.h) and run the build again.' >&2
+    exit 2
+  }
+  KERNEL_MAKE_ARGS+=(CC=clang LLVM=1)
+fi
+
 sha256_file(){
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print tolower($1)}'; return; fi
   if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print tolower($1)}'; return; fi
@@ -73,6 +86,7 @@ src="$tmpdir/v4l2loopback-$VERSION"
 make -C "$src" \
   KERNELRELEASE="$KERNEL_RELEASE" \
   KERNEL_DIR="$KERNEL_BUILD" \
+  "${KERNEL_MAKE_ARGS[@]}" \
   v4l2loopback.ko
 
 module="$src/v4l2loopback.ko"

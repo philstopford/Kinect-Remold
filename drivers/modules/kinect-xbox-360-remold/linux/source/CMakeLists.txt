@@ -42,6 +42,11 @@ if(REMOLD_BUILD_HARDWARE)
   pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
   pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
   find_package(OpenCV REQUIRED COMPONENTS core imgproc objdetect)
+  # CascadeClassifier moved out of objdetect into xobjdetect in OpenCV 5.
+  # Request the extra module only there so builds with OpenCV 4 remain valid.
+  if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
+    find_package(OpenCV REQUIRED COMPONENTS core imgproc objdetect xobjdetect)
+  endif()
 
   add_executable(kinect360-remold-broker src/broker.cpp)
   target_link_libraries(kinect360-remold-broker PRIVATE remold_common PkgConfig::LIBUSB Threads::Threads)
