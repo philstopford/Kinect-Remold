@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cmath>
 
 namespace KinectOneRemoldProtocol {
 
@@ -52,16 +53,19 @@ enum PixelFormat : std::uint32_t {
 //       clients keep receiving exactly the 68-byte v1 reply.
 constexpr std::uint32_t kDepthCalibrationNative = 2u;
 constexpr std::uint32_t kDepthCalibrationNativeExtended = 3u;
+constexpr std::uint32_t kDepthCalibrationNativeFull = 4u;
 
 // Backward-compatible opt-in: a client that understands ReplyExtension writes this
 // marker into RequestV2.deviceId[63] and keeps the NUL-terminated id <= 62 bytes.
 // Older servers read the id with strnlen() and ignore bytes after its terminator.
 constexpr std::uint8_t kReplyExtensionRequest = 0xC3u;
+constexpr std::uint8_t kReplyExtensionFullRequest = 0xC4u;
 constexpr std::uint32_t kReplyExtensionMagic = 0x31584352u;  // "RCX1"
 constexpr std::uint32_t kReplyExtensionVersion = 1u;
 enum ReplyExtensionFlags : std::uint32_t {
     ReplyExtensionDepthDistortion = 1u,
     ReplyExtensionColorIntrinsics = 1u << 1,
+    ReplyExtensionColorPolynomial = 1u << 2,
 };
 
 enum Result : std::int32_t {
@@ -118,6 +122,13 @@ struct ReplyExtension {
     float colorShiftD = 0, colorShiftM = 0;
 };
 
+// Request marker C4 opts into the 20 factory polynomial coefficients used by
+// Kinect v2 depth-to-color mapping. The first 64 bytes remain ReplyExtension.
+struct ReplyExtensionV2 {
+    ReplyExtension base{};
+    float colorPolynomial[20]{}; // mx terms [0..9], my terms [10..19]
+};
+
 struct MotionSample {
     std::uint32_t flags = 0;
     std::int32_t accelX = 0;
@@ -146,11 +157,16 @@ static_assert(sizeof(Request) == 16);
 static_assert(sizeof(RequestV2) == 80);
 static_assert(sizeof(Reply) == 68);
 static_assert(sizeof(ReplyExtension) == 64);
+static_assert(sizeof(ReplyExtensionV2) == 144);
 static_assert(sizeof(MotionSample) == 28);
 static_assert(sizeof(FrameHeader) == 76);
 
 inline bool extensionRequested(const RequestV2& request) {
-    return static_cast<std::uint8_t>(request.deviceId[sizeof(request.deviceId) - 1]) == kReplyExtensionRequest;
+    const auto marker = static_cast<std::uint8_t>(request.deviceId[sizeof(request.deviceId) - 1]);
+    return marker == kReplyExtensionRequest || marker == kReplyExtensionFullRequest;
+}
+inline bool fullExtensionRequested(const RequestV2& request) {
+    return static_cast<std::uint8_t>(request.deviceId[sizeof(request.deviceId) - 1]) == kReplyExtensionFullRequest;
 }
 
 // Fills ReplyExtension from the decoded depth calibration (k1..p2) and the raw
@@ -168,6 +184,25 @@ inline ReplyExtension makeReplyExtension(float k1, float k2, float k3, float p1,
             ext.colorShiftD = v[3]; ext.colorShiftM = v[4];
             ext.flags |= ReplyExtensionColorIntrinsics;
         }
+    }
+    return ext;
+}
+
+inline ReplyExtensionV2 makeReplyExtensionV2(float k1, float k2, float k3, float p1, float p2,
+                                             const std::uint8_t* colorParams, std::size_t colorBytes) {
+    ReplyExtensionV2 ext{};
+    ext.base = makeReplyExtension(k1,k2,k3,p1,p2,colorParams,colorBytes);
+    ext.base.version = 2;
+    ext.base.bytes = sizeof(ReplyExtensionV2);
+    if (colorParams && colorBytes >= 101 && (ext.base.flags & ReplyExtensionColorIntrinsics)) {
+        std::memcpy(ext.colorPolynomial,colorParams+21,sizeof(ext.colorPolynomial));
+        bool finite = true, nonzero = false;
+        for (float coefficient : ext.colorPolynomial) {
+            finite &= std::isfinite(coefficient) && std::abs(coefficient) < 1e8f;
+            nonzero |= std::abs(coefficient) > 1e-8f;
+        }
+        if (finite && nonzero) ext.base.flags |= ReplyExtensionColorPolynomial;
+        else std::memset(ext.colorPolynomial,0,sizeof(ext.colorPolynomial));
     }
     return ext;
 }

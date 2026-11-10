@@ -12,6 +12,7 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%2B%20x64-0078d4)
 ![Linux](https://img.shields.io/badge/Linux-x86--64-fcc624)
+![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-999999)
 ![Kinect](https://img.shields.io/badge/Kinect-1414%20%7C%201473%20%7C%201517%20%7C%20v2-22c55e)
 ![Audio](https://img.shields.io/badge/Xbox%20360%20audio-4ch%20%4016kHz-8b5cf6)
 
@@ -61,7 +62,7 @@ Both modules are available on Windows and Linux through one capability-driven St
 ### SynKinect Studio features
 
 - **3D Scanner** — Turntable and moving-Kinect fusion with TSDF reconstruction, Refine HQ and STL/OBJ/PLY export.
-- **SynSkeleton body tracking** — `SynSkeleton.onnx` is the single pose source for body, hands and fingers. Metric Depth feeds the neural model and calibrates its XYZ output; all Studio modules consume the same neural skeleton.
+- **Body and hand tracking** — the default RGB path downloads MoveNet and RTMPose Hand, then uses registered metric depth for observed 3D joints. An optional depth-only `SynSkeleton.onnx` path requires a separately trained model.
 - **Interactivity** — hand-driven desktop pointer with per-hand interaction zones, push-to-click, two-hand gestures and a two-hand **air keyboard**.
 - **Motion Capture** — real-time body streaming as VMC (OSC/UDP), plain OSC, JSON over UDP and WebSocket to VSeeFace, Unity, Blender and Unreal, plus BVH recording.
 - **Sensor Calibration** — per-device depth calibration from flat-wall captures with an optional tape reference, measured by a ground-truth **calibration benchmark**.
@@ -167,6 +168,145 @@ SynKinect Studio is generated under:
 ```text
 binaries\windows\applications\SynKinectStudio\
 ```
+
+## macOS (Apple Silicon)
+
+For native Qt capture workflows, see the [Qt user guide](docs/QT-USER-GUIDE.md).
+For implementation status and improvement priorities, see the
+[Qt developer guide](docs/QT-DEVELOPER-GUIDE.md).
+
+The macOS build uses Apple's IOKit/IOUSBHost APIs for native Kinect USB
+discovery. Its Qt frontend uses the same local driver protocol as SynKinect
+Studio and requires no JDK or libusb. Install CMake, Qt 6 and ONNX Runtime
+(for example `brew install cmake qt onnxruntime`), then build the app bundle:
+
+```bash
+./Kinect-Remold-macos.sh --build-only
+```
+
+Open `binaries/macos/applications/KinectRemoldQt.app` directly in Finder. The
+bundle contains its native USB host and starts it automatically; no terminal is
+needed while using the app. Running `./Kinect-Remold-macos.sh` remains a
+build-and-launch shortcut, and `--driver-only` starts native discovery alone.
+The Qt app discovers both generations through per-user Unix sockets under
+`/tmp`. The native service uses IOUSBHost for control, bulk and isochronous
+transfers. Kinect One/v2 publishes a camera endpoint when it negotiates
+SuperSpeed. On a connected `02d8` sensor, repeated native RGB/depth and
+IR/depth subscriptions delivered complete frames through a USB-C adapter.
+Model 1520 (`045e:02c4`) and model 1565 (`045e:02d8`) use the same native
+Kinect One transport. Both advertise the camera endpoint after SuperSpeed
+negotiation and accept the same control, calibration and stream requests.
+The earlier `02c4` opt-in gate has been removed. Model 1565 has delivered
+RGB/depth/IR frames on macOS. A short Qt preview check on model 1520 also
+delivered RGB, metric depth and infrared; sustained throughput and reliability
+on that model still need measurement.
+Xbox 360 streaming remains unimplemented and is reported as
+`NativeTransportPending`. The Qt `Probe USB` action opens the selected native
+interface and reports the result.
+For Kinect One/v2, discovery reports `USB3Required` when the USB-C adapter or
+hub negotiates below SuperSpeed. Use an adapter with USB 3 data support and
+the sensor's required external power supply; first-generation sensors also
+require their normal external power supply.
+
+The Qt frontend is shared source that can also be built on Windows and Linux
+with Qt 6. It provides device discovery, live RGB, depth and IR previews,
+independent sensor windows, Xbox 360 RGB HQ and manual LED/tilt controls where
+the driver advertises them,
+PNG export of the current frame, calibrated single-frame metric-depth
+point-cloud export to PLY, depth-surface export to OBJ, and MP4 recording of the selected preview
+when a platform driver publishes a camera endpoint.
+Windows and Linux recording uses FFmpeg from the application directory or `PATH`;
+macOS recording uses AVFoundation.
+The Qt Surveillance window monitors ready cameras independently, changes to
+infrared in darkness, detects motion, and records indexed MJPEG AVI event files
+per camera with up to 60 seconds of pre-roll. The Qt Microphones window captures
+and records the four-channel Remold PCM endpoint where a driver advertises audio;
+it shows per-channel levels and
+exposes the driver's volume and mute controls. It also estimates sound direction
+from microphone timing and can record a mono delay-and-sum beam. The Qt Acoustic
+Scanner shows an azimuth and an accumulating direction map from the same
+four-channel input.
+The Qt Sensor Calibration window captures flat-wall depth stations, evaluates
+an independent validation capture, and saves a per-device correction. Saved
+corrections are applied to Qt PLY and OBJ depth exports. Keep the validation
+wall at a different distance from the training wall when possible.
+The Qt 3D Scanner window now integrates calibrated metric depth into a TSDF,
+tracks camera motion with point-to-plane ICP, expands its volume as needed,
+shows an orbitable mesh preview after capture, and exports the fused surface as
+OBJ, binary PLY, or binary STL. The longer live check on the attached Kinect
+One integrated 30 depth frames without tracking rejection. Turntable-specific
+capture now isolates a central depth band, removes a detected support plane,
+constrains ICP to yaw and in-plane translation, and reports accumulated sweep.
+Kinect One now accumulates factory-registered RGB near the TSDF surface and
+exports vertex colors in PLY and OBJ. A 30-frame live capture produced 51,494
+triangles, 43,253 with color. Loop closure and Refine HQ remain to be ported
+from the Java scanner. STL carries geometry only.
+Build the Qt frontend directly on Linux with `scripts/linux/BUILD-QT.sh` or on
+Windows with `scripts/windows/Build-Qt.ps1` in PowerShell. These entry points
+require Qt 6.4+, the Qt WebSockets module, ONNX Runtime and CMake; the Windows script also uses `windeployqt`. They
+download the same SHA-256-pinned MoveNet and RTMPose Hand models as the Java
+reference builders. The ONNX Runtime CMake package is required for every Qt
+build. The existing Windows and Linux launchers still start the Java Studio.
+On macOS, the Qt builder retrieves the same SHA-256-pinned MoveNet and RTMPose
+Hand assets as the Windows/Linux builders and bundles native ONNX
+Runtime. MoveNet provides live 2D body landmarks on any Qt build with ONNX
+Runtime and `models/movenet.onnx` beside the executable. The Qt Body + hands
+preview runs the pinned RTMPose Hand model on MoveNet-guided hand crops on all
+three platforms; Apple Vision also provides 2D hand and face landmark overlays.
+Body + hands pairs RGB with recent metric depth and can save observed camera-space
+joint positions as JSON. Kinect One now requests the factory depth-to-color
+polynomial (with the older nominal projection as a compatibility fallback).
+The polynomial reply and live tracking passed on the attached model 1520;
+registration accuracy still needs a measured target before precise avatar motion
+or desktop interaction can be claimed.
+The Qt Motion Capture workspace now has a live video/3D skeleton split view,
+an orbitable stage, a 60-second pose timeline, JSON/OSC/VMC/WebSocket outputs,
+mirrored Unity rig output and BVH recording. It can publish observations and
+preview authenticated remote sensor hosts over mutual-TLS WebSockets. Remote
+observations are **preview-only**; clock discipline, room calibration,
+multi-person association and multi-sensor fusion remain unfinished. See
+[Qt Motion Capture workspace](docs/QT-MOCAP-WORKSPACE.md).
+The latest camera Start action takes ownership of that sensor across Qt windows.
+Motion Capture defaults to a large video overlay and shows a green, yellow, or
+red local-fit marker with framing and joint-quality guidance. Body joints are
+filtered for temporal jitter and implausible RGB/depth associations before
+retargeting and export.
+Motion Capture can run body and hands, face, or both. Its guided pose capture
+uses system beeps for start, success, and missed-pose cues; a body-stability
+slider adjusts the smoothness and response tradeoff.
+The Calibrate side tab now offers separate automatic Body and Face guides with
+large distance, framing and next-pose instructions. A 60-frame fit check
+recommends framing changes or calibration before recording.
+The Qt Motion Capture stream now uses an Apache-2.0 ONNX conversion of
+MediaPipe's 478-point face landmark model and a locally converted ONNX
+blendshape regressor. It records 51 measured ARKit-compatible expression
+coefficients (the source model does not infer `tongueOut`), face landmarks and
+landmark-derived head orientation in JSONL/WebSocket output. Face Cap OSC and
+VMC Face blendshape sinks are available. JSON UDP sends the body pose and a
+separate compact facial landmark packet to stay within datagram limits.
+Motion Capture offers a 50-frame neutral face calibration for blendshape
+baselines and relative head orientation; it lasts for that window session.
+The attached Kinect One delivered 149 face observations and 100 body-rig
+packets in a 150-frame live check. Head-pose accuracy and coefficient
+repeatability still need measurement, and facial eye/gaze and `tongueOut`
+support are not complete.
+When a separately trained `SynSkeleton.onnx` is supplied with `REMOLD_SYNSKELETON_MODEL`,
+the Qt Depth skeleton mode runs the Java model's 58-landmark metric-depth
+contract and previews its 3D body and hand landmarks. The model is not included
+in this repository. Qt does not yet publish these landmarks to the Motion
+Capture, Interactivity, or external module interfaces.
+The Processing Studio's full turntable and Refine HQ scanner workflow,
+precise RGB-depth registration, Interactivity and external module SDK remain
+to be ported to Qt. The Qt calibration benchmark currently reports planar RMS and
+center distance; it does not yet reproduce every Studio quality metric.
+
+The macOS Kinect One/v2 driver publishes RGB, metric depth and infrared to
+the Qt app and Remold camera protocol. Sustained tests on the connected sensor
+delivered roughly 14 RGB frames and 30 depth frames per second in a Release
+build. RGB throughput still needs work before it can match the sensor's 30 fps target.
+Audio and operating-system camera/microphone endpoints are not implemented.
+See [macOS parity](docs/MACOS-PARITY.md) for the driver and Studio capability
+comparison with Windows and Linux.
 
 ## Linux build
 
@@ -276,9 +416,9 @@ The same SynKinect Studio module code runs on Windows and Linux. Linux maps the 
 
 ## Interactivity, skeleton and motion capture
 
-Body tracking is model-driven. `applications/processing/SynKinectStudio/data/skeleton/SynSkeleton.onnx` is the authoritative pose source for the entire Studio. The model receives calibrated metric Depth and publishes 58 landmarks: head/face anchors, body joints and 21 detailed hand landmarks per side. The Studio converts the model's normalized XY + metric Z output into calibrated camera-space XYZ, derives only the canonical torso/foot anchors required by the Remold API, and applies light temporal stabilization to landmarks that are actually observed in the current frame. There is no geometric/articulated pose fallback when the model is missing or a landmark is not detected. Interactivity, Motion Capture and external modules all receive this same pose through `BodyTrackingSession`. See [`docs/SKELETON-3D-ARCHITECTURE.md`](docs/SKELETON-3D-ARCHITECTURE.md).
+Body tracking is model-driven. The default RGB mode uses downloaded MoveNet and RTMPose Hand models with synchronized metric depth to recover observed 3D joints. The optional depth mode uses a separately trained `SynSkeleton.onnx` with 58 landmarks; its weights are not among the reference build downloads. There is no geometric/articulated pose fallback when a model is missing or a landmark is not detected. Interactivity, Motion Capture and external modules consume the selected pose through `BodyTrackingSession`. See [`docs/SKELETON-3D-ARCHITECTURE.md`](docs/SKELETON-3D-ARCHITECTURE.md).
 
-Hands and fingers come directly from the same `SynSkeleton.onnx` output. A hand is not synthesized when the model does not detect it; detailed hand rendering and interaction use only current model landmarks plus derived palm/body-hand anchors supported by those landmarks. See [`docs/HANDS-AND-FINGERS.md`](docs/HANDS-AND-FINGERS.md).
+In RGB mode, the pinned RTMPose Hand model supplies 21 image landmarks per detected hand, and points without valid registered depth are dropped. Depth mode gets hand landmarks from `SynSkeleton.onnx`. See [`docs/HANDS-AND-FINGERS.md`](docs/HANDS-AND-FINGERS.md).
 
 Interactivity drives the desktop pointer: each hand owns an interaction zone anchored at its shoulder and scaled by arm length, a relative push toward the sensor clicks, the second hand gives right click, double click and scroll, and holding both hands above the head opens an **air keyboard** on which both hands type. Display framing is a fixed metric frame referenced to **1.10 m** and never auto-zooms the detector or cursor mapping. See [`docs/INTERACTIVITY-CONTROLS.md`](docs/INTERACTIVITY-CONTROLS.md).
 

@@ -1,0 +1,8 @@
+Kinect Remold uses the Kinect v2 factory depth-to-color polynomial published by
+the OpenKinect libfreenect2 project. The mapping in applications/qt/RgbdRegistration.cpp
+is adapted from RegistrationImpl::depth_to_color in libfreenect2 registration.cpp.
+
+Copyright (c) 2014 individual OpenKinect contributors.
+Upstream: https://github.com/OpenKinect/libfreenect2
+License option used: Apache License, Version 2.0 (APACHE20 in this directory).
+Contributor list: CONTRIB in this directory.

@@ -141,7 +141,19 @@ private:
             if (begin) buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(begin));
             if (buffer_.size() > MaxFrameBytes) { buffer_.erase(buffer_.begin(), buffer_.begin() + 2); continue; }
             std::size_t end = 2;
-            while (end + 1 < buffer_.size() && !(buffer_[end] == Eoi0 && buffer_[end + 1] == Eoi1)) ++end;
+            bool restarted = false;
+            while (end + 1 < buffer_.size() && !(buffer_[end] == Eoi0 && buffer_[end + 1] == Eoi1)) {
+                // A new SOI before EOI means the preceding JPEG was truncated.
+                // Resynchronize at the new frame instead of forwarding both
+                // images as one malformed payload.
+                if (buffer_[end] == Soi0 && buffer_[end + 1] == Soi1) {
+                    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(end));
+                    restarted = true;
+                    break;
+                }
+                ++end;
+            }
+            if (restarted) continue;
             if (end + 1 >= buffer_.size()) return;
             end += 2;
             ready_.emplace_back(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(end));

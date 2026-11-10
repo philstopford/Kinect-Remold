@@ -11,6 +11,8 @@
 - `windows/BUILD-STUDIO.cmd` — bootstraps pinned Processing/JOGL/GlueGen dependencies, builds the Studio JAR, creates the bundled Java runtime and packages the native Windows application image.
 - `windows/PACKAGE-APPLICATION.cmd` — packages the generated native Windows application image.
 - `linux/BUILD-STUDIO.sh` — bootstraps pinned dependencies and JDK 17+ when needed, rebuilds the Studio JAR, and creates the self-contained Linux Java runtime with `jlink`.
+- `windows/Build-Qt.ps1` and `linux/BUILD-QT.sh` — build the native Qt frontend alongside the Java Studio. Qt 6.4+ with Qt WebSockets and an ONNX Runtime CMake package are required; set `onnxruntime_DIR` if it is outside the standard CMake search path. The builders package the ONNX Runtime library and download the pinned MoveNet and RTMPose Hand models. Linux and Windows MP4 recording also needs FFmpeg on the application path.
+- `macos/BUILD-STUDIO.sh` — packages the native Qt app bundle with ONNX Runtime and verified model assets.
 
 Native driver outputs and generated Studio payloads are build outputs and are not repository inputs.
 
@@ -18,4 +20,4 @@ Native driver outputs and generated Studio payloads are build outputs and are no
 
 Top-level and platform build entry points resolve paths relative to their own script location rather than the caller's working directory. Windows `.cmd` files remain ASCII/CRLF-safe; Linux `.sh` files are distributed executable and use script-root discovery that tolerates symlinks, spaces and wrapper directories introduced by repeated archive extraction.
 
-The Studio builders install the SHA-256-pinned MoveNet RGB ONNX model automatically. See `REMOLD_MOVENET_MODEL_URL` and `REMOLD_MOVENET_MODEL_SHA256` in `config/build.env`. A failed model download or checksum check stops the build.
+The Studio builders install the SHA-256-pinned MoveNet RGB and RTMPose Hand ONNX models automatically. See their URLs and hashes in `config/build.env`. A failed model download or checksum check stops the build.

@@ -4,10 +4,10 @@ Both operating systems use the same Studio tracking configuration at `applicatio
 
 ## Models
 
-- `tracking.mode=rgb` (default): MoveNet ONNX body-pose model (`data/skeleton/movenet.onnx`). RGB frames must be synchronized with calibrated depth for 3D projection. MoveNet has 17 body keypoints; **it does not provide 21 finger landmarks**. Fine hand tracking in RGB mode therefore remains unavailable until a separate hand model and crop pipeline are integrated.
+- `tracking.mode=rgb` (default): MoveNet ONNX body-pose model (`data/skeleton/movenet.onnx`) and RTMPose Hand (`data/skeleton/rtmpose-hand.onnx`) for 21 hand landmarks per detected hand. RGB frames must be synchronized with calibrated depth for 3D projection; image points without a nearby valid depth reading are dropped.
 - `tracking.mode=depth`: `SynSkeleton.onnx` exported by Kinect DepthAutoLearn. Uses the calibrated metric-depth input `[1,1,240,320]` and `keypoints` output `[1,58,4]`, which includes left/right hand landmarks.
 
-**Model weights are not bundled.** Use the proper ONNX model for the chosen backend; the two networks are not interchangeable. To select a mode and install a model from a local file:
+The RGB model weights are downloaded and SHA-256 verified by the reference builders. The optional depth model is not bundled or downloaded. To select a mode and install a model from a local file:
 
 ```sh
 python scripts/configure_tracking.py --mode rgb --model /path/to/movenet.onnx

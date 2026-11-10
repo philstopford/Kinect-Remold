@@ -3,10 +3,12 @@
 ## Scope and trust boundary
 
 One **coordinator** owns person association, calibration revision selection and
-the fused articulated solve. Each **sensor host** owns one or more local Kinect
-streams and sends calibrated observations. A host never commands another host's
-USB device. Control and data connections are mutually authenticated and
-encrypted; discovery is explicit rather than broadcast on untrusted networks.
+the fused articulated solve. The coordinator listens for mutually authenticated
+WebSocket connections. Each **sensor host** selects a local Kinect, connects to
+the coordinator and sends its observations. A host never commands another host's
+USB device. Discovery is explicit rather than broadcast on untrusted networks.
+The transport also permits the coordinator to dial a listening sensor host,
+but the host-to-coordinator connection is the main workflow.
 
 ## Clock and calibration handshake
 
@@ -40,16 +42,18 @@ rejection per joint. It selects a valid unobscured observation rather than
 averaging incompatible limbs. The resulting skeleton is passed to the existing
 temporal IK, joint-limit, finger and foot-contact solve.
 
-## Required implementation work
+## Implementation status and required work
 
-1. Implement authenticated coordinator/host transport, clock discipline and
-   calibration workflow.
-2. Publish local tracked observations from `BodyTrackingSession`, then implement
-   fusion, association and replay tests.
-3. Add a face ONNX model with redistribution licence, SHA-256, strict tensor
-   validation, RGB crop/landmark inference, ARKit-52 regression and head/eye
-   pose.
-4. Implement Face Cap and VMC Face sinks plus the JSON rig-profile loader and
-   recorder.
-5. Validate with synchronized physical multi-Kinect captures, ground truth,
-   occlusion scenarios, clock fault injection and receiver interoperability.
+The Qt application implements a mutually authenticated controller/host
+WebSocket link and publishes ordered local observations for remote preview.
+It also has local ONNX face landmarks and blendshapes, Face Cap/VMC outputs,
+JSONL and BVH recording. These local features do not imply multi-sensor
+fusion. Remote observations are not merged into the local solve or exports.
+
+Capture-grade multi-host support still requires measured clock discipline,
+room extrinsic calibration and revision management, subject association,
+bounded temporal fusion, and a fused articulated solve. It then needs replay
+tests and synchronized physical captures with occlusion, clock fault and
+receiver interoperability checks. See the [Qt developer guide](QT-DEVELOPER-GUIDE.md#4-finish-capture-grade-multi-sensor-solving)
+for the implementation sequence and [Qt user guide](QT-USER-GUIDE.md#lan-sensor-sessions)
+for current operation.

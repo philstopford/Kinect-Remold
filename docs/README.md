@@ -29,6 +29,8 @@ This directory is the engineering and user documentation for Kinect Remold. Star
 | Compare Kinect models and supported capabilities | [Compatibility matrix](KINECT-COMPATIBILITY-MATRIX.md) |
 | Understand the common cross-model user contract | [Unified device contract](UNIFIED-DEVICE-CONTRACT.md) |
 | Check what is implemented versus what still needs physical validation | [Functionality status](FUNCTIONALITY-STATUS.md) |
+| Use the native Qt capture application | [Qt user guide](QT-USER-GUIDE.md) |
+| Develop and improve native Qt capture | [Qt developer guide](QT-DEVELOPER-GUIDE.md) |
 
 ## Sensor and Studio
 
@@ -39,6 +41,8 @@ This directory is the engineering and user documentation for Kinect Remold. Star
 - [Scanner 3D viewport](SCANNER-3D-VIEWPORT.md) — shared Turntable/Kinect fusion workflow, tracking policies, trajectory, navigation, partial-mesh workflow and coordinate integrity.
 - [SynSkeleton 3D architecture](SKELETON-3D-ARCHITECTURE.md) — SynSkeleton.onnx model contract, calibrated 3D mapping, body-tracking block, hands/fingers and no-fallback behavior.
 - [Motion capture](MOTION-CAPTURE.md) — real-time VMC / OSC / JSON / WebSocket body streaming to VSeeFace, Unity, Blender and Unreal, humanoid retargeting and BVH recording.
+- [Qt motion capture user guide](QT-USER-GUIDE.md) — setup, framing, guided calibration, quality markers, recording and troubleshooting in the native app.
+- [Qt developer guide](QT-DEVELOPER-GUIDE.md) — implementation map, validation evidence, known limits and prioritized improvements.
 - [Module layout](MODULE-LAYOUT.md) — frontend/backend rule, Studio source files, module data and driver-module directories.
 - [Interactivity controls](INTERACTIVITY-CONTROLS.md) — hand interaction zones, push-to-click, two-hand gestures and the air keyboard.
 - [Hands and fingers](HANDS-AND-FINGERS.md) — body-level hands and near-field finger refinement (Portuguese).
