@@ -1,4 +1,5 @@
 #include "OnnxHandTracker.hpp"
+#include "OnnxExecutionProvider.hpp"
 
 #include <onnxruntime/onnxruntime_cxx_api.h>
 #include <QPainter>
@@ -16,6 +17,7 @@ struct OnnxHandTracker::Impl {
   Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "KinectRemoldHands"};
   std::unique_ptr<Ort::Session> session;
   QString error;
+  QString provider;
   std::string inputName;
   std::array<std::string, 2> outputNames;
   std::array<int, 2> outputLengths{};
@@ -24,14 +26,7 @@ struct OnnxHandTracker::Impl {
 
 OnnxHandTracker::OnnxHandTracker(const QString& modelPath) : impl_(std::make_unique<Impl>()) {
   try {
-    Ort::SessionOptions options;
-    options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-#ifdef _WIN32
-    const std::wstring nativePath = modelPath.toStdWString();
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, nativePath.c_str(), options);
-#else
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, modelPath.toUtf8().constData(), options);
-#endif
+    impl_->session=remold::createOnnxSession(impl_->env,modelPath,0,"REMOLD_ONNX_HAND_PROVIDER",&impl_->provider);
     Ort::AllocatorWithDefaultOptions allocator;
     if (impl_->session->GetInputCount() != 1 || impl_->session->GetOutputCount() < 2)
       throw std::runtime_error("Unexpected RTMPose Hand input/output count");
@@ -72,6 +67,7 @@ OnnxHandTracker::OnnxHandTracker(const QString& modelPath) : impl_(std::make_uni
 OnnxHandTracker::~OnnxHandTracker() = default;
 bool OnnxHandTracker::ready() const { return bool(impl_->session); }
 QString OnnxHandTracker::error() const { return impl_->error; }
+QString OnnxHandTracker::provider() const { return impl_->provider; }
 std::array<std::array<BodyKeypoint,21>,2> OnnxHandTracker::keypoints() const {
   return impl_->points;
 }
@@ -80,6 +76,7 @@ QImage OnnxHandTracker::annotate(const QImage& image, const std::array<BodyKeypo
   impl_->points = {};
   if (!ready() || image.isNull()) return image;
   QImage output = image.convertToFormat(QImage::Format_RGB32);
+  const QImage rgb=image.convertToFormat(QImage::Format_RGB888);
   QPainter painter(&output);
   painter.setRenderHint(QPainter::Antialiasing);
   painter.setPen(QPen(QColor(255, 183, 63), 2));
@@ -97,7 +94,6 @@ QImage OnnxHandTracker::annotate(const QImage& image, const std::array<BodyKeypo
       const float side = std::clamp(forearm * 1.55f, 72.0f, 190.0f);
       const float x0 = wx + (wx - ex) * 0.2f - side * 0.5f;
       const float y0 = wy + (wy - ey) * 0.2f - side * 0.5f;
-      const QImage rgb = image.convertToFormat(QImage::Format_RGB888);
       std::vector<float> pixels(3 * 256 * 256);
       constexpr float mean[]{123.675f, 116.28f, 103.53f};
       constexpr float stddev[]{58.395f, 57.12f, 57.375f};

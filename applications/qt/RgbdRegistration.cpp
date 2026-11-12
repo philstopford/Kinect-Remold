@@ -107,6 +107,24 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
   for(int hand=0;hand<2;++hand) for(int i=0;i<21;++i)
     imagePoints[16+hand*21+i]=hands[hand][i];
   const float maxDistance=std::max(12.0f,colorWidth/1920.0f*34.0f);
+  // Index projected depth by color pixel. A joint only needs candidates inside
+  // maxDistance, so scanning the entire depth cloud for every joint is wasteful.
+  constexpr int binSize=16;
+  const int binCols=(colorWidth+binSize-1)/binSize;
+  const int binRows=(colorHeight+binSize-1)/binSize;
+  std::vector<std::vector<int>> bins(size_t(binCols)*binRows);
+  for(int index=0;index<int(projected.size());++index) {
+    const auto& p=projected[size_t(index)];
+    bins[size_t(int(p.v)/binSize)*binCols+int(p.u)/binSize].push_back(index);
+  }
+  auto nearby=[&](float u,float v,const auto& visit) {
+    const int left=std::max(0,int(std::floor((u-maxDistance)/binSize)));
+    const int right=std::min(binCols-1,int(std::floor((u+maxDistance)/binSize)));
+    const int top=std::max(0,int(std::floor((v-maxDistance)/binSize)));
+    const int bottom=std::min(binRows-1,int(std::floor((v+maxDistance)/binSize)));
+    for(int by=top;by<=bottom;++by)for(int bx=left;bx<=right;++bx)
+      for(int index:bins[size_t(by)*binCols+bx])visit(projected[size_t(index)]);
+  };
   for(int i=0;i<jointCount;++i) {
     const BodyKeypoint keypoint=imagePoints[i];
     if(keypoint.confidence<(i>=16?.45f:.14f)||!std::isfinite(keypoint.x)||
@@ -115,12 +133,12 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
     const float targetU=keypoint.x*colorWidth,targetV=keypoint.y*colorHeight;
     float best=maxDistance*maxDistance;
     const ProjectedPoint* selected=nullptr;
-    for(const auto& p:projected) {
+    nearby(targetU,targetV,[&](const ProjectedPoint& p) {
       if(expectedPersonDepth>0&&
-         std::abs(p.xyz.z()-expectedPersonDepth)>(i>=16?.9f:i>=12?.35f:i>=10?.55f:.7f))continue;
+         std::abs(p.xyz.z()-expectedPersonDepth)>(i>=16?.9f:i>=12?.35f:i>=10?.55f:.7f))return;
       const float du=p.u-targetU,dv=p.v-targetV,distance=du*du+dv*dv;
       if(distance<best) {best=distance;selected=&p;}
-    }
+    });
     if(!selected) continue;
     const float registrationQuality=std::max(.1f,1-std::sqrt(best)/maxDistance);
     result[i]={selected->xyz,keypoint.confidence*registrationQuality,true};
@@ -142,16 +160,16 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
       float best=maxDistance*maxDistance;
       float bestDistance=best;
       const ProjectedPoint* selected=nullptr;
-      for(const auto& p:projected) {
+      nearby(targetU,targetV,[&](const ProjectedPoint& p) {
         if(expectedPersonDepth>0&&
-           std::abs(p.xyz.z()-expectedPersonDepth)>(i>=12?.35f:i>=10?.55f:.7f))continue;
-        if(std::abs(p.xyz.z()-torsoZ)>depthRange)continue;
-        if(i>=12&&std::abs(p.xyz.z()-torsoZ)>.35f)continue;
+           std::abs(p.xyz.z()-expectedPersonDepth)>(i>=12?.35f:i>=10?.55f:.7f))return;
+        if(std::abs(p.xyz.z()-torsoZ)>depthRange)return;
+        if(i>=12&&std::abs(p.xyz.z()-torsoZ)>.35f)return;
         const float du=p.u-targetU,dv=p.v-targetV,distance=du*du+dv*dv;
         const float score=distance+(i>=12?2500.f*(p.xyz.z()-torsoZ)*
             (p.xyz.z()-torsoZ):0.f);
         if(score<best) {best=score;bestDistance=distance;selected=&p;}
-      }
+      });
       if(!selected) {result[i]={};continue;}
       const float quality=std::max(.1f,1-std::sqrt(bestDistance)/maxDistance);
       result[i]={selected->xyz,keypoint.confidence*quality,true};

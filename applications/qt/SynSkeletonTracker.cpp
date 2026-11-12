@@ -1,4 +1,5 @@
 #include "SynSkeletonTracker.hpp"
+#include "OnnxExecutionProvider.hpp"
 
 #include <onnxruntime/onnxruntime_cxx_api.h>
 #include <QPainter>
@@ -26,14 +27,7 @@ struct SynSkeletonTracker::Impl {
 
 SynSkeletonTracker::SynSkeletonTracker(const QString& modelPath) : impl_(std::make_unique<Impl>()) {
   try {
-    Ort::SessionOptions options;
-    options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-#ifdef _WIN32
-    const std::wstring nativePath = modelPath.toStdWString();
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, nativePath.c_str(), options);
-#else
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, modelPath.toUtf8().constData(), options);
-#endif
+    impl_->session=remold::createOnnxSession(impl_->env,modelPath,0,"REMOLD_ONNX_SKELETON_PROVIDER");
     Ort::AllocatorWithDefaultOptions allocator;
     const auto inputName = impl_->session->GetInputNameAllocated(0, allocator);
     const auto inputType = impl_->session->GetInputTypeInfo(0);

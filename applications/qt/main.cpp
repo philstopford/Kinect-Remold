@@ -5,11 +5,14 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QDoubleSpinBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFile>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QImage>
@@ -37,6 +40,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStandardPaths>
+#include <QStorageInfo>
 #include <QTemporaryDir>
 #include <QTableWidget>
 #include <QTabWidget>
@@ -76,6 +80,7 @@
 #include "MocapRig.hpp"
 #include "FaceMeshTopology.hpp"
 #include "MocapBvh.hpp"
+#include "MocapClipProcessor.hpp"
 #include "LanPoseLink.hpp"
 #ifdef Q_OS_MACOS
 #include "macos/VisionTracker.hpp"
@@ -399,6 +404,8 @@ signals:
   void depthReady(QByteArray depth, int width, int height, double fx, double fy,
                   double cx, double cy, QByteArray extension);
   void poseReady(QByteArray poseJson);
+  void profileReady(double bodyMs,double handMs,double faceMs,double liftMs,int frames);
+  void providerReady(QString body,QString hands,QString face);
   void message(QString text);
 protected:
   void run() override {
@@ -445,6 +452,10 @@ protected:
 #endif
       skeleton = std::make_unique<SynSkeletonTracker>(modelPath);
     }
+#endif
+#ifdef REMOLD_HAS_ONNX
+    if(body)emit providerReady(body->provider(),hands?hands->provider():"Off",
+        face?face->provider():"Off");
 #endif
     QLocalSocket socket;
     QByteArray request;
@@ -519,6 +530,9 @@ protected:
     bool poseCalibrationChecked=false;
     float personDepth=0;
     int personDepthMisses=0;
+    const bool profileMocap=!qEnvironmentVariableIsEmpty("REMOLD_PROFILE_MOCAP");
+    double bodyMs=0,handMs=0,faceMs=0,liftMs=0;
+    int profileFrames=0;
     while (!isInterruptionRequested()) {
       const QByteArray header = readExact(socket, 76, this);
       if (header.size() != 76) break;
@@ -563,12 +577,16 @@ protected:
 #ifdef REMOLD_HAS_ONNX
         if (overlay_ == 1 && body && body->ready()) image = body->annotate(image);
         if ((overlay_ == 5 || overlay_ == 6 || overlay_ == 7) && body && body->ready()) {
+          QElapsedTimer phase; if(profileMocap)phase.start();
           const QImage original=image;
           const QImage bodyImage=body->annotate(image);
+          if(profileMocap){bodyMs+=phase.nsecsElapsed()*1e-6;phase.restart();}
           if(overlay_!=6)image=bodyImage;
           if (hands && hands->ready()) image = hands->annotate(image, body->keypoints());
+          if(profileMocap){handMs+=phase.nsecsElapsed()*1e-6;phase.restart();}
           QJsonObject facial=face&&face->ready()?
               face->track(original,body->keypoints()):QJsonObject{};
+          if(profileMocap){faceMs+=phase.nsecsElapsed()*1e-6;phase.restart();}
           QJsonArray imageBody;
           if(overlay_!=6)for(const BodyKeypoint& keypoint:body->keypoints())
             imageBody.append(QJsonArray{keypoint.x,keypoint.y,keypoint.confidence});
@@ -590,6 +608,9 @@ protected:
             if(!facial.isEmpty())root["face"]=facial;
             emit frameReady(image);
             emit poseReady(QJsonDocument(root).toJson(QJsonDocument::Compact));
+            if(profileMocap&&++profileFrames%60==0)
+              emit profileReady(bodyMs/profileFrames,handMs/profileFrames,
+                  faceMs/profileFrames,0,profileFrames);
           } else {
           const quint64 skew=frameTick>latestDepthTick?frameTick-latestDepthTick:
               latestDepthTick-frameTick;
@@ -599,10 +620,20 @@ protected:
               poseCalibration.load(calibrationPath(device_.id),device_.id,
                                    latestCamera.width,latestCamera.height);
             }
+            if(profileMocap)phase.restart();
             const auto pose=RgbdRegistration::lift(latestDepth,latestCamera,&poseCalibration,
                 image.width(),image.height(),device_.generation==QStringLiteral("xbox-one"),
                 body->keypoints(),hands?hands->keypoints():
                     std::array<std::array<BodyKeypoint,21>,2>{},personDepth);
+            if(profileMocap){liftMs+=phase.nsecsElapsed()*1e-6;
+              if(++profileFrames%60==0) {
+                qInfo("Mocap stage ms/frame (%d): body %.2f hands %.2f face %.2f RGBD lift %.2f",
+                    profileFrames,bodyMs/profileFrames,handMs/profileFrames,
+                    faceMs/profileFrames,liftMs/profileFrames);
+                emit profileReady(bodyMs/profileFrames,handMs/profileFrames,
+                    faceMs/profileFrames,liftMs/profileFrames,profileFrames);
+              }
+            }
             std::vector<float> torsoDepths;
             for(int index:{4,5,10,11})
               if(pose[index].valid&&pose[index].confidence>=.2f)
@@ -2181,6 +2212,65 @@ class MotionCaptureWindow : public QMainWindow {
       smoother_.setStability(value);
     });
     sources->addStretch();layout->addLayout(sources);
+    auto* performanceRow=new QHBoxLayout;
+    performanceRow->addWidget(new QLabel("INFERENCE"));
+    bodyProvider_=new QComboBox;handProvider_=new QComboBox;faceProvider_=new QComboBox;
+#ifdef Q_OS_MACOS
+    const QStringList providerChoices{"CPU","Core ML"};
+#else
+    const QStringList providerChoices{"CPU","CUDA"};
+#endif
+    bodyProvider_->addItems(providerChoices);handProvider_->addItems(providerChoices);
+    faceProvider_->addItems(providerChoices);
+    auto activeProvider=[](const char* key) {
+      QByteArray value=qgetenv(key).toLower();
+      if(value.isEmpty())value=qgetenv("REMOLD_ONNX_PROVIDER").toLower();
+#ifdef Q_OS_MACOS
+      return value=="coreml"?1:0;
+#else
+      return value=="cuda"?1:0;
+#endif
+    };
+    bodyProvider_->setCurrentIndex(activeProvider("REMOLD_ONNX_BODY_PROVIDER"));
+    handProvider_->setCurrentIndex(activeProvider("REMOLD_ONNX_HAND_PROVIDER"));
+    faceProvider_->setCurrentIndex(activeProvider("REMOLD_ONNX_FACE_PROVIDER"));
+    performanceRow->addWidget(new QLabel("Body"));performanceRow->addWidget(bodyProvider_);
+    performanceRow->addWidget(new QLabel("Hands"));performanceRow->addWidget(handProvider_);
+    performanceRow->addWidget(new QLabel("Face"));performanceRow->addWidget(faceProvider_);
+    fitEnabled_=new QCheckBox("Articulated fit");fitEnabled_->setChecked(true);
+    performanceRow->addWidget(fitEnabled_);
+    connect(fitEnabled_,&QCheckBox::toggled,this,[this]{bodyFit_.reset();});
+    profileEnabled_=new QCheckBox("Show timing");performanceRow->addWidget(profileEnabled_);
+    profileEnabled_->setChecked(!qEnvironmentVariableIsEmpty("REMOLD_PROFILE_MOCAP"));
+    auto* applyProvider=new QPushButton("Apply providers");
+    applyProvider->setToolTip("Recreates the model sessions and restarts tracking. Stop recording first.");
+    performanceRow->addWidget(applyProvider);
+    performanceRow->addStretch();layout->addLayout(performanceRow);
+    performance_=new QLabel("Timing off · provider changes restart tracking");
+    layout->addWidget(performance_);
+    connect(applyProvider,&QPushButton::clicked,this,[this]{
+      if(recording_||bvh_.recording()) {
+        performance_->setText("Stop recording before changing inference providers.");return;
+      }
+      auto choice=[](QComboBox* box){return box->currentIndex()==0?"cpu":
+#ifdef Q_OS_MACOS
+          "coreml";
+#else
+          "cuda";
+#endif
+      };
+      qputenv("REMOLD_ONNX_BODY_PROVIDER",choice(bodyProvider_));
+      qputenv("REMOLD_ONNX_HAND_PROVIDER",choice(handProvider_));
+      qputenv("REMOLD_ONNX_FACE_PROVIDER",choice(faceProvider_));
+      performance_->setText("Applying providers · tracking restarts");
+      if(worker_)start();
+    });
+    connect(profileEnabled_,&QCheckBox::toggled,this,[this](bool on){
+      if(on)qputenv("REMOLD_PROFILE_MOCAP","1");
+      else qunsetenv("REMOLD_PROFILE_MOCAP");
+      performance_->setText(on?"Timing starts after tracking restarts":"Timing off");
+      if(worker_&&!recording_&&!bvh_.recording())start();
+    });
     auto* qualityRow=new QHBoxLayout;
     quality_=new QLabel("NO BODY");quality_->setAlignment(Qt::AlignCenter);
     quality_->setMinimumSize(230,52);
@@ -2209,14 +2299,16 @@ class MotionCaptureWindow : public QMainWindow {
     vmcPort_=new QSpinBox;vmcPort_->setRange(1,65535);vmcPort_->setValue(39539);
     faceCapPort_=new QSpinBox;faceCapPort_->setRange(1,65535);faceCapPort_->setValue(39543);
     webPort_=new QSpinBox;webPort_->setRange(1,65535);webPort_->setValue(39540);
-    recordButton_=new QPushButton("Record JSONL");
+    recordFormat_=new QComboBox;
+    recordFormat_->addItems({"Compact clip","JSONL"});
+    recordButton_=new QPushButton("Record clip");
     bvhButton_=new QPushButton("Record BVH");
     outputs->addWidget(jsonEnabled_);outputs->addWidget(jsonPort_);
     outputs->addWidget(oscEnabled_);outputs->addWidget(oscPort_);
     outputs->addWidget(vmcEnabled_);outputs->addWidget(vmcPort_);
     outputs->addWidget(webEnabled_);outputs->addWidget(webPort_);
     outputs->addWidget(unityEnabled_);outputs->addWidget(mirrorEnabled_);
-    outputs->addWidget(recordButton_);outputs->addStretch();layout->addLayout(outputs);
+    outputs->addWidget(recordFormat_);outputs->addWidget(recordButton_);outputs->addStretch();layout->addLayout(outputs);
     outputs->addWidget(bvhButton_);
     auto* faceOutputs=new QHBoxLayout;
     faceOutputs->addWidget(new QLabel("Face · 478 landmarks + 51 measured expressions"));
@@ -2381,7 +2473,11 @@ class MotionCaptureWindow : public QMainWindow {
     timelineLabel_=new QLabel("00:00 / LIVE");
     timelineRow->addWidget(playButton_);timelineRow->addWidget(liveButton_);
     timelineRow->addWidget(timeline_,1);timelineRow->addWidget(timelineLabel_);
+    openClipButton_=new QPushButton("Open clip…");timelineRow->addWidget(openClipButton_);
+    editButton_=new QPushButton("Edit recording…");timelineRow->addWidget(editButton_);
     layout->addLayout(timelineRow);
+    storage_=new QLabel("Preview capped at 64 MiB · recordings stream to disk");
+    layout->addWidget(storage_);
     status_=new QLabel;layout->addWidget(status_);setCentralWidget(central);
     connect(refreshButton,&QPushButton::clicked,this,[this]{refresh();});
     connect(startButton,&QPushButton::clicked,this,[this]{start();});
@@ -2389,6 +2485,8 @@ class MotionCaptureWindow : public QMainWindow {
     connect(stopButton,&QPushButton::clicked,this,[this]{stop();});
     connect(recordButton_,&QPushButton::clicked,this,[this]{toggleRecording();});
     connect(bvhButton_,&QPushButton::clicked,this,[this]{toggleBvh();});
+    connect(editButton_,&QPushButton::clicked,this,[this]{editRecording();});
+    connect(openClipButton_,&QPushButton::clicked,this,[this]{openClip();});
     connect(viewMode_,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this](int index){
       stage_->setView(static_cast<MocapStageView::View>(index));
     });
@@ -2396,11 +2494,12 @@ class MotionCaptureWindow : public QMainWindow {
       live_=false;showTimeline(index);
     });
     connect(liveButton_,&QPushButton::clicked,this,[this]{
+      if(clipFile_.isOpen()) {clipFile_.close();clipIndex_.reset();timeline_->setRange(0,0);}
       live_=true;playing_=false;playButton_->setText("Play");
       if(!history_.empty())showTimeline(int(history_.size())-1);
     });
     connect(playButton_,&QPushButton::clicked,this,[this]{
-      if(history_.empty())return;
+      if(history_.empty()&&!clipFile_.isOpen())return;
       playing_=!playing_;live_=false;playButton_->setText(playing_?"Pause":"Play");
       if(playing_&&timeline_->value()>=timeline_->maximum())timeline_->setValue(0);
     });
@@ -2448,7 +2547,8 @@ class MotionCaptureWindow : public QMainWindow {
     });
     refresh();
   }
-  ~MotionCaptureWindow() override {stop();lan_.stop();}
+  ~MotionCaptureWindow() override {stop();lan_.stop();if(editorThread_)editorThread_->wait();
+    if(indexThread_)indexThread_->wait();}
   int checkLive(bool requireFace=false,bool requireFullBody=false,
                 bool bodyOn=true,bool faceOn=true) {
     if(found_.empty()) return 2;
@@ -2467,13 +2567,16 @@ class MotionCaptureWindow : public QMainWindow {
     faceCapEnabled_->setChecked(true);
     QTemporaryDir directory;
     if(!directory.isValid()) return 4;
-    const QString path=directory.path()+"/poses.jsonl";
+    const bool compact=QCoreApplication::arguments().contains("--check-live-compact");
+    const QString path=directory.path()+(compact?"/poses.rmclip":"/poses.jsonl");
     const QString bvhPath=directory.path()+"/poses.bvh";
     start();
     if(!bvh_.start(bvhPath)) {stop();return 5;}
     file_.setFileName(path);
     if(!file_.open(QIODevice::WriteOnly)) {stop();return 5;}
-    recorded_=0;recording_=true;
+    compactRecording_=compact;
+    if(compact&&file_.write("RMC1",4)!=4){stop();return 5;}
+    recorded_=0;recordedBytes_=compact?4:0;recording_=true;
     QElapsedTimer timeout;timeout.start();
     while(timeout.elapsed()<15000&&recorded_<((requireFace||requireFullBody)?150:10)) {
       QApplication::processEvents();QThread::msleep(20);
@@ -2517,6 +2620,16 @@ class MotionCaptureWindow : public QMainWindow {
     }
     const bool transport=frames>=10&&QFileInfo(path).size()>1000&&
         jsonReceiver.hasPendingDatagrams()&&oscFrame;
+    bool compactReadable=true;
+    if(compact) {
+      MocapClipOptions options;options.source=path;
+      options.output=directory.path()+"/roundtrip.jsonl";
+      const auto roundtrip=MocapClipProcessor::process(options);
+      compactReadable=roundtrip.error.isEmpty()&&roundtrip.frames==frames;
+      fprintf(stderr,"Compact clip: %d decoded frames, %llu bytes, %s\n",
+          roundtrip.frames,(unsigned long long)QFileInfo(path).size(),
+          qPrintable(roundtrip.error));
+    }
     QByteArray facePacket;
     while(faceReceiver.hasPendingDatagrams()) {
       QByteArray packet(int(faceReceiver.pendingDatagramSize()),0);
@@ -2534,7 +2647,7 @@ class MotionCaptureWindow : public QMainWindow {
           bvhData.startsWith("HIERARCHY\n"),vmcPacket.contains("/VMC/Ext/Bone/Pos"),
           oscPacket.contains("/synkinect/bone"));
     if(network_.vmcPackets()==0) fprintf(stderr,"Mocap rig: no person tracked in this capture\n");
-    return transport&&rigOutput&&timelineReady&&
+    return transport&&rigOutput&&timelineReady&&compactReadable&&
         (!requireFace||(faceFrames_>0&&facePacket.contains("/W")&&
                        network_.facePackets()>0))&&
         (!requireFullBody||(fullBodyFrames_>0&&network_.vmcPackets()>0))?0:6;
@@ -2642,8 +2755,9 @@ class MotionCaptureWindow : public QMainWindow {
     else if(!faceOn)calibrationList_->setCurrentRow(0);
     smoother_.reset();
     bodyFit_.reset();
+    clipFile_.close();clipIndex_.reset();
     smoother_.setStability(stability_->value());
-    history_.clear();timeline_->setRange(0,0);live_=true;playing_=false;
+    history_.clear();historyBytes_=0;timeline_->setRange(0,0);live_=true;playing_=false;
     faceFrames_=0;fullBodyFrames_=0;maxPoseBytes_=0;
     playButton_->setText("Play");timelineLabel_->setText("00:00 / LIVE");
     const int index=devices_->currentIndex();
@@ -2667,7 +2781,17 @@ class MotionCaptureWindow : public QMainWindow {
     });
     connect(worker_,&StreamWorker::poseReady,this,[this](const QByteArray& rawPose){
       const QJsonObject rawRoot=QJsonDocument::fromJson(rawPose).object();
-      QJsonObject root=bodyFit_.fit(smoother_.filter(rawRoot));
+      QElapsedTimer fitTimer;
+      const bool profileFit=!qEnvironmentVariableIsEmpty("REMOLD_PROFILE_MOCAP");
+      if(profileFit)fitTimer.start();
+      QJsonObject smoothed=smoother_.filter(rawRoot);
+      QJsonObject root=fitEnabled_->isChecked()?bodyFit_.fit(std::move(smoothed)):std::move(smoothed);
+      if(profileFit) {
+        fitMs_+=fitTimer.nsecsElapsed()*1e-6;
+        if(++fitFrames_%120==0)qInfo("Mocap filter + solve ms/frame (%d): %.3f",
+            fitFrames_,fitMs_/fitFrames_);
+        lastFitMs_=fitMs_/fitFrames_;
+      }
       const bool tracked=root.value("tracked").toBool();
       if(root.value("face").toObject().value("tracked").toBool())++faceFrames_;
       QJsonObject face=root.value("face").toObject();
@@ -2788,9 +2912,14 @@ class MotionCaptureWindow : public QMainWindow {
                       tracked?"Tracking":"Searching");
       lan_.broadcastPose(pose);
       const HumanoidPose rig=rig_.retarget(pose,mirrorEnabled_->isChecked());
-      history_.push_back(pose);
-      if(history_.size()>1800) {history_.pop_front();if(!live_&&timeline_->value()>0)
-        timeline_->setValue(timeline_->value()-1);}
+      history_.push_back(pose);historyBytes_+=size_t(pose.size());
+      constexpr size_t previewLimit=64u*1024u*1024u;
+      while(history_.size()>1&&(history_.size()>1800||historyBytes_>previewLimit||
+          root.value("t").toDouble()-QJsonDocument::fromJson(history_.front()).object()
+              .value("t").toDouble()>60.)) {
+        historyBytes_-=size_t(history_.front().size());history_.pop_front();
+        if(!live_&&timeline_->value()>0)timeline_->setValue(timeline_->value()-1);
+      }
       timeline_->setRange(0,int(history_.size())-1);
       if(live_) showTimeline(int(history_.size())-1);
       const QString capturePath=qEnvironmentVariable("REMOLD_SOLVE_CAPTURE");
@@ -2815,12 +2944,42 @@ class MotionCaptureWindow : public QMainWindow {
       web_.broadcast(output);
       bvh_.append(rig);
       if(recording_) {
-        if(file_.write(recordedOutput)!=recordedOutput.size()||file_.write("\n",1)!=1) {
+        QByteArray packed;
+        if(compactRecording_) {
+          const QByteArray compressed=qCompress(recordedOutput,3);
+          const quint32 size=quint32(compressed.size());
+          packed.resize(4);for(int i=0;i<4;++i)packed[i]=char((size>>(i*8))&255);
+          packed+=compressed;
+        } else {packed=recordedOutput;packed+='\n';}
+        if(file_.write(packed)!=packed.size()) {
           status_->setText(file_.errorString());stopRecording();
-        } else ++recorded_;
+        } else {
+          ++recorded_;recordedBytes_+=quint64(packed.size());
+          if(recorded_%120==0) {
+            const QStorageInfo disk(QFileInfo(file_.fileName()).absolutePath());
+            storage_->setText(QString("Recorded %1 MiB · disk free %2 GiB · preview %3 MiB")
+                .arg(recordedBytes_/(1024.0*1024.0),0,'f',1)
+                .arg(disk.bytesAvailable()/(1024.0*1024.0*1024.0),0,'f',1)
+                .arg(historyBytes_/(1024.0*1024.0),0,'f',1));
+            if(disk.isValid()&&disk.bytesAvailable()<128ll*1024*1024) {
+              stopRecording();storage_->setText("Recording stopped: less than 128 MiB free");
+            }
+          }
+        }
       }
     });
     connect(worker_,&StreamWorker::message,status_,&QLabel::setText);
+    connect(worker_,&StreamWorker::providerReady,this,[this](const QString& body,const QString& hands,
+        const QString& face){
+      providerSummary_=QString("Body %1 · hands %2 · face %3").arg(body,hands,face);
+      performance_->setText(providerSummary_+(profileEnabled_->isChecked()?" · measuring…":" · timing off"));
+    });
+    connect(worker_,&StreamWorker::profileReady,this,[this](double body,double hands,
+        double face,double lift,int frames){
+      performance_->setText(providerSummary_+QString(" · %1 frames · body %2 ms · hands %3 ms · face %4 ms · depth %5 ms · filter/fit %6 ms")
+          .arg(frames).arg(body,0,'f',1).arg(hands,0,'f',1).arg(face,0,'f',1)
+          .arg(lift,0,'f',1).arg(lastFitMs_,0,'f',2));
+    });
     worker_->startLatest();
   }
   void stop() {
@@ -3113,6 +3272,27 @@ class MotionCaptureWindow : public QMainWindow {
             {"frameMargin",margin}};
   }
   void showTimeline(int index) {
+    if(clipFile_.isOpen()&&clipIndex_) {
+      const QJsonObject frame=clipIndex_->frameAt(clipFile_,index);
+      if(frame.isEmpty())return;
+      timeline_->setValue(index);stage_->setFrame({});
+      stage_->setPose(QJsonDocument(frame).toJson(QJsonDocument::Compact));
+      const QJsonObject face=frame.value("face").toObject();
+      const QJsonObject shapes=face.value("blendshapes").toObject();
+      auto amount=[&](const char* name){return shapes.value(QLatin1String(name)).toDouble();};
+      jawMeter_->setValue(int(std::lround(amount("jawOpen")*100)));
+      smileMeter_->setValue(int(std::lround((amount("mouthSmileLeft")+
+          amount("mouthSmileRight"))*50)));
+      blinkMeter_->setValue(int(std::lround((amount("eyeBlinkLeft")+
+          amount("eyeBlinkRight"))*50)));
+      faceStatus_->setText(!face.value("tracked").toBool()?"Face: none in clip":
+          face.value("registration").toObject().value("state").toString().startsWith("aligned")?
+          "Face: aligned mesh + expressions":"Face: expressions only");
+      timelineLabel_->setText(QString("%1 / %2 s")
+          .arg(frame.value("t").toDouble()-clipIndex_->firstTime,0,'f',1)
+          .arg(clipIndex_->lastTime-clipIndex_->firstTime,0,'f',1));
+      return;
+    }
     if(index<0||index>=int(history_.size()))return;
     timeline_->setValue(index);
     if(selectedSensor_=="local") {stage_->setFrame(lastFrame_);stage_->setPose(history_[size_t(index)]);}
@@ -3120,6 +3300,28 @@ class MotionCaptureWindow : public QMainWindow {
     const double newest=QJsonDocument::fromJson(history_.back()).object().value("t").toDouble();
     const double age=std::max(0.,newest-root.value("t").toDouble());
     timelineLabel_->setText(live_?"LIVE":QString("-%1 s").arg(age,0,'f',1));
+  }
+  void openClip() {
+    if(indexThread_||editorThread_)return;
+    const QString path=QFileDialog::getOpenFileName(this,"Open motion clip",{},
+        "Motion clips (*.rmclip *.jsonl)");
+    if(path.isEmpty())return;
+    stop();clipFile_.close();clipIndex_.reset();history_.clear();historyBytes_=0;
+    openClipButton_->setEnabled(false);status_->setText("Indexing clip…");
+    auto index=std::make_shared<MocapClipIndex>();
+    indexThread_=QThread::create([path,index]{*index=MocapClipIndex::build(path);});
+    connect(indexThread_,&QThread::finished,this,[this,index]{
+      indexThread_=nullptr;openClipButton_->setEnabled(true);
+      if(!index->error.isEmpty()){status_->setText("Clip open failed: "+index->error);return;}
+      clipFile_.setFileName(index->source);
+      if(!clipFile_.open(QIODevice::ReadOnly)){status_->setText(clipFile_.errorString());return;}
+      clipIndex_=index;live_=false;playing_=false;playButton_->setText("Play");
+      timeline_->setRange(0,index->frames-1);viewMode_->setCurrentIndex(2);
+      showTimeline(0);
+      status_->setText(QString("Opened %1 frames · sparse on-disk index").arg(index->frames));
+    });
+    connect(indexThread_,&QThread::finished,indexThread_,&QObject::deleteLater);
+    indexThread_->start();
   }
   void toggleBvh() {
     if(bvh_.recording()) {
@@ -3137,25 +3339,109 @@ class MotionCaptureWindow : public QMainWindow {
     QApplication::beep();
     bvhButton_->setText("Stop BVH");
   }
+  void editRecording() {
+    if(editorThread_||indexThread_)return;
+    QDialog dialog(this);dialog.setWindowTitle("Process motion capture");
+    auto* layout=new QVBoxLayout(&dialog);auto* form=new QFormLayout;
+    auto pathRow=[&](const QString& name,bool save,QLineEdit*& edit) {
+      auto* holder=new QWidget(&dialog);auto* row=new QHBoxLayout(holder);
+      row->setContentsMargins(0,0,0,0);edit=new QLineEdit(holder);
+      auto* browse=new QPushButton("Browse…",holder);row->addWidget(edit,1);row->addWidget(browse);
+      connect(browse,&QPushButton::clicked,&dialog,[dialogPtr=&dialog,edit,name,save]{
+        const QString path=save?QFileDialog::getSaveFileName(dialogPtr,name,{},
+            "Remold compact clip (*.rmclip);;JSON Lines (*.jsonl)"):
+            QFileDialog::getOpenFileName(dialogPtr,name,{},"Motion clips (*.jsonl *.rmclip)");
+        if(!path.isEmpty())edit->setText(path);
+      });
+      form->addRow(name,holder);
+    };
+    QLineEdit *source,*face,*output;
+    pathRow("Body or combined recording",false,source);
+    pathRow("Optional face recording",false,face);
+    pathRow("Processed output",true,output);
+    connect(source,&QLineEdit::textChanged,&dialog,[output](const QString& path){
+      if(output->text().isEmpty()&&!path.isEmpty()) {
+        const QFileInfo info(path);
+        output->setText(info.dir().filePath(info.completeBaseName()+"-edited.rmclip"));
+      }
+    });
+    auto seconds=[&](const QString& label,double value) {
+      auto* spin=new QDoubleSpinBox(&dialog);spin->setRange(0,86400);spin->setDecimals(2);
+      spin->setSuffix(" s");spin->setValue(value);form->addRow(label,spin);return spin;
+    };
+    auto* trimStart=seconds("Trim from start",0);
+    auto* trimEnd=seconds("Trim end time (0 = full)",0);
+    auto* faceOffset=seconds("Face sync offset",0);
+    faceOffset->setRange(-86400,86400);
+    auto* loopBlend=seconds("Loop crossfade (0 = off)",0);
+    auto* smoothing=new QSlider(Qt::Horizontal,&dialog);
+    smoothing->setRange(0,100);smoothing->setValue(0);
+    form->addRow("Noise reduction",smoothing);
+    auto* inPlace=new QCheckBox("Remove root travel for an in-place loop",&dialog);
+    inPlace->setChecked(true);form->addRow(inPlace);
+    auto* exportBvh=new QCheckBox("Export edited BVH alongside JSONL",&dialog);
+    form->addRow(exportBvh);
+    layout->addLayout(form);
+    auto* hint=new QLabel("Processing writes a new clip with bounded memory. Looping selects a matching pose seam, blends the overlap, removes root travel when requested, and holds detected planted feet. Separate face mesh alignment needs a visible nose and both ears in the body clip.",&dialog);
+    hint->setWordWrap(true);layout->addWidget(hint);
+    auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);
+    connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);layout->addWidget(buttons);
+    if(dialog.exec()!=QDialog::Accepted)return;
+    MocapClipOptions options;
+    options.source=source->text();options.face=face->text();options.output=output->text();
+    options.trimStart=trimStart->value();options.trimEnd=trimEnd->value();
+    options.faceOffset=faceOffset->value();options.loopBlend=loopBlend->value();
+    options.smoothing=smoothing->value();options.inPlaceLoop=inPlace->isChecked();
+    if(exportBvh->isChecked()) {
+      options.bvhOutput=options.output;
+      if(options.bvhOutput.endsWith(".jsonl",Qt::CaseInsensitive))options.bvhOutput.chop(6);
+      else if(options.bvhOutput.endsWith(".rmclip",Qt::CaseInsensitive))options.bvhOutput.chop(7);
+      options.bvhOutput+=".bvh";
+    }
+    auto result=std::make_shared<MocapClipResult>();
+    editButton_->setEnabled(false);status_->setText("Processing clip…");
+    editorThread_=QThread::create([options,result]{*result=MocapClipProcessor::process(options);});
+    connect(editorThread_,&QThread::finished,this,[this,result]{
+      status_->setText(!result->error.isEmpty()?"Clip processing failed: "+result->error:
+          !result->warning.isEmpty()?QString("Processed %1 frames · %2")
+              .arg(result->frames).arg(result->warning):
+          result->seamEndFrame>0?QString("Processed %1 frames · seam %2–%3 · score %4 · %5 planted foot frames")
+              .arg(result->frames).arg(result->seamStartFrame).arg(result->seamEndFrame)
+              .arg(result->seamScore,0,'f',3).arg(result->plantedFootFrames):
+          QString("Processed %1 frames").arg(result->frames));
+      editButton_->setEnabled(true);editorThread_=nullptr;
+    });
+    connect(editorThread_,&QThread::finished,editorThread_,&QObject::deleteLater);
+    editorThread_->start();
+  }
   void toggleRecording() {
     if(recording_) {stopRecording();return;}
     const QString folder=QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    compactRecording_=recordFormat_->currentIndex()==0;
     const QString suggested=folder+"/Kinect-mocap-"+
-        QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss")+".jsonl";
+        QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss")+
+        (compactRecording_?".rmclip":".jsonl");
     const QString path=QFileDialog::getSaveFileName(this,"Record camera-space poses",suggested,
-                                                    "JSON Lines (*.jsonl)");
+        compactRecording_?"Remold compact clip (*.rmclip)":"JSON Lines (*.jsonl)");
     if(path.isEmpty()) return;
     file_.setFileName(path);
     if(!file_.open(QIODevice::WriteOnly)) {status_->setText(file_.errorString());return;}
-    recorded_=0;recording_=true;recordButton_->setText("Stop recording");
+    if(compactRecording_&&file_.write("RMC1",4)!=4) {
+      status_->setText(file_.errorString());file_.cancelWriting();return;
+    }
+    recorded_=0;recordedBytes_=compactRecording_?4:0;recording_=true;
+    recordButton_->setText("Stop recording");
     QApplication::beep();
   }
   void stopRecording() {
     if(!recording_) return;
     const bool saved=file_.commit();recording_=false;
-    recordButton_->setText("Record JSONL");
+    recordButton_->setText("Record clip");
     QApplication::beep();QTimer::singleShot(220,this,[]{QApplication::beep();});
     status_->setText(saved?QString("Recorded %1 pose frames").arg(recorded_):file_.errorString());
+    if(saved)storage_->setText(QString("Saved %1 MiB · preview remains capped at 64 MiB")
+        .arg(recordedBytes_/(1024.0*1024.0),0,'f',1));
   }
   std::vector<Device> found_;
   QComboBox* devices_=nullptr;QCheckBox* jsonEnabled_=nullptr;QCheckBox* oscEnabled_=nullptr;
@@ -3184,16 +3470,26 @@ class MotionCaptureWindow : public QMainWindow {
   QListWidget* calibrationList_=nullptr;int calibrationStep_=-1;
   QCheckBox* bodyEnabled_=nullptr;QCheckBox* faceEnabled_=nullptr;
   QSlider* stability_=nullptr;
+  QComboBox* bodyProvider_=nullptr;QComboBox* handProvider_=nullptr;QComboBox* faceProvider_=nullptr;
+  QCheckBox* fitEnabled_=nullptr;QCheckBox* profileEnabled_=nullptr;
+  QLabel* performance_=nullptr;
+  QString providerSummary_;
   bool activeBody_=true,activeFace_=true;
   QSlider* timeline_=nullptr;QLabel* timelineLabel_=nullptr;
+  QLabel* storage_=nullptr;quint64 recordedBytes_=0;
+  QPushButton* editButton_=nullptr;QThread* editorThread_=nullptr;
+  QPushButton* openClipButton_=nullptr;QThread* indexThread_=nullptr;
+  QFile clipFile_;std::shared_ptr<MocapClipIndex> clipIndex_;
   QPushButton* playButton_=nullptr;QPushButton* liveButton_=nullptr;
   QLabel* status_=nullptr;QPushButton* recordButton_=nullptr;QPushButton* bvhButton_=nullptr;
+  QComboBox* recordFormat_=nullptr;bool compactRecording_=false;
   StreamWorker* worker_=nullptr;MocapNetwork network_;MocapWebSocket web_;MocapRig rig_;MocapBvh bvh_;QSaveFile file_;
   MocapPoseSmoother smoother_;
   ArticulatedPoseFit bodyFit_;
+  double fitMs_=0,lastFitMs_=0;int fitFrames_=0;
   LanPoseLink lan_;QHash<QString,QByteArray> remotePoses_;
   QString selectedSensor_="local";QImage lastFrame_;
-  std::deque<QByteArray> history_;QTimer playback_;bool live_=true,playing_=false;
+  std::deque<QByteArray> history_;size_t historyBytes_=0;QTimer playback_;bool live_=true,playing_=false;
   bool recording_=false;int recorded_=0,faceFrames_=0,fullBodyFrames_=0,maxPoseBytes_=0;
 };
 #endif
@@ -3738,6 +4034,171 @@ int main(int argc, char** argv) {
             filteredVariation/rawVariation,spike-previous,following);
     return following>.75?0:3;
   }
+  if (app.arguments().contains("--check-clip-editor")) {
+    QTemporaryDir dir;if(!dir.isValid())return 2;
+    const QString bodyPath=dir.path()+"/body.jsonl",facePath=dir.path()+"/face.jsonl";
+    QFile body(bodyPath),face(facePath);
+    if(!body.open(QIODevice::WriteOnly)||!face.open(QIODevice::WriteOnly))return 3;
+    for(int i=0;i<120;++i) {
+      const double x=i*.01+(i%2?.02:-.02);
+      const int phase=i%30;
+      const double leftAnkleX=(i/30)*.3+(phase<15?0.:(phase-15)*.02);
+      const double rightAnkleX=((i+15)/30)*.3+(phase>=15?0.:phase*.02);
+      const double leftFootY=phase<15?1.:.92;
+      const double rightFootY=phase>=15?1.:.92;
+      const QJsonObject joints{{"hipL",QJsonObject{{"p",QJsonArray{x-.1,0.,2.}}, {"c",.9}}},
+                               {"hipR",QJsonObject{{"p",QJsonArray{x+.1,0.,2.}}, {"c",.9}}},
+                               {"shoulderL",QJsonObject{{"p",QJsonArray{x-.2,-.4,2.}}, {"c",.9}}},
+                               {"shoulderR",QJsonObject{{"p",QJsonArray{x+.2,-.4,2.}}, {"c",.9}}},
+                               {"wristL",QJsonObject{{"p",QJsonArray{x-.35,.05,2.}}, {"c",.9}}},
+                               {"wristR",QJsonObject{{"p",QJsonArray{x+.35,.05,2.}}, {"c",.9}}},
+                               {"kneeL",QJsonObject{{"p",QJsonArray{(x-.1+leftAnkleX)*.5,.5,2.}}, {"c",.9}}},
+                               {"kneeR",QJsonObject{{"p",QJsonArray{(x+.1+rightAnkleX)*.5,.5,2.}}, {"c",.9}}},
+                               {"ankleL",QJsonObject{{"p",QJsonArray{leftAnkleX,leftFootY,2.}}, {"c",.9}}},
+                               {"ankleR",QJsonObject{{"p",QJsonArray{rightAnkleX,rightFootY,2.}}, {"c",.9}}},
+                               {"head",QJsonObject{{"p",QJsonArray{x,-.7,2.}}, {"c",.9}}},
+                               {"nose",QJsonObject{{"uv",QJsonArray{.5,.2}}, {"c",.9}}},
+                               {"earL",QJsonObject{{"uv",QJsonArray{.4,.2}}, {"c",.9}}},
+                               {"earR",QJsonObject{{"uv",QJsonArray{.6,.2}}, {"c",.9}}}};
+      const QJsonObject frame{{"t",1.+i/30.},{"tracked",true},
+          {"bodies",QJsonArray{QJsonObject{{"joints",joints}}}}};
+      body.write(QJsonDocument(frame).toJson(QJsonDocument::Compact)+'\n');
+      if(i%2==0) {
+        QJsonArray landmarks;
+        for(int point=0;point<478;++point)landmarks.append(QJsonArray{.5,.45,0.});
+        landmarks[234]=QJsonArray{.3,.5,0.};landmarks[454]=QJsonArray{.7,.5,0.};
+        const QJsonObject facial{{"t",5.+i/30.},
+            {"face",QJsonObject{{"tracked",true},
+                {"landmarks",landmarks},
+                {"blendshapes",QJsonObject{{"jawOpen",double(i)/120.}}}}}};
+        face.write(QJsonDocument(facial).toJson(QJsonDocument::Compact)+'\n');
+      }
+    }
+    body.close();face.close();
+    auto compact=[&](const QString& input,const QString& output) {
+      QFile src(input),dst(output);
+      if(!src.open(QIODevice::ReadOnly)||!dst.open(QIODevice::WriteOnly))return false;
+      dst.write("RMC1",4);
+      while(!src.atEnd()) {
+        const QByteArray packed=qCompress(src.readLine().trimmed(),3);
+        const quint32 n=quint32(packed.size());QByteArray prefix(4,0);
+        for(int i=0;i<4;++i)prefix[i]=char((n>>(i*8))&255);
+        if(dst.write(prefix)!=4||dst.write(packed)!=packed.size())return false;
+      }
+      return true;
+    };
+    const QString compactBody=dir.path()+"/body.rmclip",compactFace=dir.path()+"/face.rmclip";
+    if(!compact(bodyPath,compactBody)||!compact(facePath,compactFace))return 9;
+    const auto indexed=MocapClipIndex::build(compactBody);
+    QFile preview(compactBody);
+    if(!indexed.error.isEmpty()||indexed.frames!=120||!preview.open(QIODevice::ReadOnly)||
+       indexed.frameAt(preview,75).value("t").toDouble()<3.4)return 12;
+    MocapClipOptions options;
+    options.source=compactBody;options.face=compactFace;options.output=dir.path()+"/out.jsonl";
+    options.trimStart=.5;options.trimEnd=3.5;options.loopBlend=.3;
+    options.smoothing=60;options.inPlaceLoop=true;
+    options.bvhOutput=dir.path()+"/out.bvh";
+    const auto processed=MocapClipProcessor::process(options);
+    if(!processed.error.isEmpty()) {fprintf(stderr,"Clip editor: %s\n",qPrintable(processed.error));return 4;}
+    QFile out(options.output);if(!out.open(QIODevice::ReadOnly))return 5;
+    QJsonObject first,last;int count=0;double maxPlantedStep=0,previousAnkleX=0;
+    int previousInputFrame=-100;
+    while(!out.atEnd()) {
+      const auto frame=QJsonDocument::fromJson(out.readLine()).object();
+      if(frame.isEmpty()||!frame.value("face").isObject())return 6;
+      if(frame.value("face").toObject().value("registration").toObject().value("state")!="aligned")return 14;
+      const QJsonArray mappedNose=frame.value("face").toObject()
+          .value("landmarks").toArray()[1].toArray();
+      if(mappedNose.size()!=3||std::abs(mappedNose[0].toDouble()-.5)>.03||
+         std::abs(mappedNose[1].toDouble()-.2)>.03)return 16;
+      const int inputFrame=int(std::lround((frame.value("t").toDouble()-1.)*30));
+      const QJsonArray left=frame.value("bodies").toArray()[0].toObject()
+          .value("joints").toObject().value("ankleL").toObject().value("p").toArray();
+      if(left.size()==3) {
+        const double ankleX=left[0].toDouble();
+        if(inputFrame==previousInputFrame+1&&inputFrame%30>2&&inputFrame%30<15)
+          maxPlantedStep=std::max(maxPlantedStep,std::abs(ankleX-previousAnkleX));
+        previousAnkleX=ankleX;previousInputFrame=inputFrame;
+      }
+      if(count++==0)first=frame;last=frame;
+    }
+    auto x=[&](const QJsonObject& frame){return frame.value("bodies").toArray()[0].toObject()
+        .value("joints").toObject().value("hipL").toObject().value("p").toArray()[0].toDouble();};
+    fprintf(stderr,"Clip editor: %d frames, seam %.4f m, score %.4f, planted step %.4f m, held %d\n",
+        count,std::abs(x(first)-x(last)),processed.seamScore,maxPlantedStep,
+        processed.plantedFootFrames);
+    QFile bvh(options.bvhOutput);if(!bvh.open(QIODevice::ReadOnly))return 8;
+    if(count!=processed.frames||count<=50||processed.seamScore>=1e8||
+       processed.plantedFootFrames<5||
+       maxPlantedStep>=.025||std::abs(x(first)-x(last))>=.08||
+       !bvh.read(32).startsWith("HIERARCHY\n"))return 7;
+    options.output=dir.path()+"/out.rmclip";
+    options.bvhOutput=dir.path()+"/compact-out.bvh";
+    const auto compactResult=MocapClipProcessor::process(options);
+    const auto compactIndex=MocapClipIndex::build(options.output);
+    QFile compactPreview(options.output);
+    if(!compactResult.error.isEmpty()||!compactIndex.error.isEmpty()||
+       compactIndex.frames!=count||!compactPreview.open(QIODevice::ReadOnly)||
+       !compactIndex.frameAt(compactPreview,20).value("face").isObject())return 13;
+    QFile damaged(compactBody);
+    if(!damaged.open(QIODevice::ReadWrite)||!damaged.resize(damaged.size()-10))return 10;
+    damaged.close();options.output=dir.path()+"/damaged.jsonl";options.bvhOutput.clear();
+    options.trimEnd=0;
+    if(MocapClipProcessor::process(options).error.isEmpty())return 11;
+    const QString replay=qEnvironmentVariable("REMOLD_CLIP_TEST_SOURCE");
+    if(!replay.isEmpty()) {
+      MocapClipOptions real;real.source=replay;real.output=dir.path()+"/replay.rmclip";
+      real.smoothing=35;real.loopBlend=.4;real.inPlaceLoop=true;
+      const auto outcome=MocapClipProcessor::process(real);
+      const auto index=MocapClipIndex::build(real.output);
+      if(!outcome.error.isEmpty()||!index.error.isEmpty()||index.frames!=outcome.frames||
+         outcome.frames<30||outcome.seamScore>=1e8)return 15;
+      QFile replayFile(real.output);
+      if(!replayFile.open(QIODevice::ReadOnly))return 17;
+      const QJsonObject opening=index.frameAt(replayFile,0),closing=index.frameAt(replayFile,index.frames-1);
+      auto hip=[&](const QJsonObject& frame){
+        const QJsonArray bodies=frame.value("bodies").toArray();
+        if(bodies.isEmpty())return QVector3D{};
+        const QJsonObject joints=bodies[0].toObject().value("joints").toObject();
+        const QJsonArray l=joints.value("hipL").toObject().value("p").toArray();
+        const QJsonArray r=joints.value("hipR").toObject().value("p").toArray();
+        return l.size()==3&&r.size()==3?QVector3D(float((l[0].toDouble()+r[0].toDouble())*.5),
+            float((l[1].toDouble()+r[1].toDouble())*.5),float((l[2].toDouble()+r[2].toDouble())*.5)):
+            QVector3D{};
+      };
+      const double gap=(hip(opening)-hip(closing)).length();
+      fprintf(stderr,"Real clip replay: %d frames, seam score %.4f, held %d, error %s\n",
+          outcome.frames,outcome.seamScore,outcome.plantedFootFrames,qPrintable(outcome.error));
+      fprintf(stderr,"Real clip loop hip gap: %.4f m\n",gap);
+      if(gap>.12)return 15;
+      const QString faceReplay=qEnvironmentVariable("REMOLD_CLIP_TEST_FACE");
+      if(!faceReplay.isEmpty()) {
+        MocapClipOptions composite;
+        composite.source=replay;composite.face=faceReplay;
+        composite.output=qEnvironmentVariable("REMOLD_CLIP_TEST_OUTPUT");
+        if(composite.output.isEmpty())composite.output=dir.path()+"/face-composite.rmclip";
+        const auto attached=MocapClipProcessor::process(composite);
+        const auto faceIndex=MocapClipIndex::build(composite.output);
+        if(!attached.error.isEmpty()||!faceIndex.error.isEmpty()||faceIndex.frames<30)return 18;
+        QFile faceFile(composite.output);if(!faceFile.open(QIODevice::ReadOnly))return 19;
+        int aligned=0,expressions=0;
+        for(int i=0;i<faceIndex.frames;++i) {
+          const QJsonObject face=faceIndex.frameAt(faceFile,i).value("face").toObject();
+          if(face.value("registration").toObject().value("state").toString().startsWith("aligned"))++aligned;
+          if(face.value("blendshapes").isObject())++expressions;
+        }
+        fprintf(stderr,"Real face composite: %d aligned meshes, %d expression frames\n",
+            aligned,expressions);
+        if(expressions<30)return 20;
+        MocapClipOptions faceLoop;
+        faceLoop.source=faceReplay;faceLoop.output=dir.path()+"/face-loop.rmclip";
+        faceLoop.loopBlend=.4;faceLoop.inPlaceLoop=true;
+        const auto loopedFace=MocapClipProcessor::process(faceLoop);
+        if(!loopedFace.error.isEmpty()||loopedFace.frames<30||loopedFace.warning.isEmpty())return 21;
+      }
+    }
+    return 0;
+  }
   if (app.arguments().contains("--check-articulated-fit")) {
     ArticulatedPoseFit fit;
     auto frame=[&](int index,double elbowNoise) {
@@ -3862,7 +4323,8 @@ int main(int argc, char** argv) {
     bvh.append(pose);if(!bvh.stop()) return 7;
     QFile file(path);if(!file.open(QIODevice::ReadOnly)) return 8;
     const QByteArray data=file.readAll();
-    return data.startsWith("HIERARCHY\n")&&data.contains("Frames: 1\n")&&
+    return data.startsWith("HIERARCHY\n")&&
+        data.contains("Frames: 00000000000000000001\n")&&
         data.contains("JOINT LeftUpperArm")&&
         data.contains("OFFSET -30.0000 0.0000 0.0000")?0:9;
   }
@@ -4182,6 +4644,10 @@ int main(int argc, char** argv) {
     return mocap.checkLive(true,false,false,true);
   }
   if (app.arguments().contains("--check-live-body-only")) {
+    MotionCaptureWindow mocap;
+    return mocap.checkLive(false,true,true,false);
+  }
+  if (app.arguments().contains("--check-live-compact")) {
     MotionCaptureWindow mocap;
     return mocap.checkLive(false,true,true,false);
   }

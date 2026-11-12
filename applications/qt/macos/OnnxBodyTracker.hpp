@@ -16,6 +16,7 @@ class OnnxBodyTracker {
   OnnxBodyTracker& operator=(const OnnxBodyTracker&) = delete;
   bool ready() const;
   QString error() const;
+  QString provider() const;
   QImage annotate(const QImage& image);
   std::array<BodyKeypoint, 17> keypoints() const;
  private:

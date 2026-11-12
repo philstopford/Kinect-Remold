@@ -15,6 +15,7 @@ class OnnxFaceTracker {
   ~OnnxFaceTracker();
   bool ready() const;
   QString error() const;
+  QString provider() const;
   QJsonObject track(const QImage& image,const std::array<BodyKeypoint,17>& body,
                     QImage* annotated=nullptr);
  private:

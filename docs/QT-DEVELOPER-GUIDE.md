@@ -58,11 +58,64 @@ shape, preprocessing, license and coefficient mapping are part of the runtime
 contract. The optional `SynSkeleton.onnx` is not a generally available 58
 landmark dependency and is not required for the RGB workflow.
 
+Qt ONNX inference defaults to CPU. Set `REMOLD_ONNX_PROVIDER=coreml` on macOS
+or `REMOLD_ONNX_PROVIDER=cuda` with a CUDA-enabled ONNX Runtime build to try
+acceleration; provider setup failures fall back to CPU. Set
+`REMOLD_ONNX_BODY_PROVIDER`, `REMOLD_ONNX_HAND_PROVIDER`,
+`REMOLD_ONNX_FACE_PROVIDER`, or `REMOLD_ONNX_SKELETON_PROVIDER` to override
+that choice per model. Set
+`REMOLD_PROFILE_MOCAP=1` to print rolling mean milliseconds for body, hands,
+face, RGB/depth lifting, and filter/solve during mocap capture. On the attached Apple Silicon
+Kinect One release test, Core ML was slower than CPU for MoveNet but faster
+for RTMPose Hand. CPU remains the portable default; setting
+`REMOLD_ONNX_HAND_PROVIDER=coreml` selects the measured faster hand path on
+that system. Depth registration bins projected points in
+color-image space before searching for each joint.
+
+Motion Capture exposes Body, Hands and Face provider selectors, an articulated-fit
+switch, and a live timing readout. Applying a provider recreates the ONNX
+sessions and restarts tracking; recordings must be stopped first. Stability
+and articulated-fit controls apply during tracking. The Edit recording dialog
+processes `.rmclip` or JSONL captures into a new compact clip or JSONL file with trim, noise
+reduction, optional face overlay using capture-relative time plus an offset,
+and an in-place crossfaded loop. It can also export the edited BVH. Separate
+face landmarks are aligned from mesh nose and cheek points to body nose and
+ear image anchors with a 2D similarity fit. A visible nose plus one ear can
+continue alignment, and a recent fit can follow the nose through a short ear
+dropout. If anchors are insufficient or a three-anchor residual exceeds 0.055
+of the image, the composite keeps expressions and labels the mesh unavailable.
+This is image-space registration, not a calibrated 3D face-to-body transform.
+The loop editor searches candidate opening and closing poses, including limb
+motion and planted-foot state, then blends the selected overlap. In-place
+loops remove root travel and hold a detected planted ankle while fitting the
+knee to the hip and foot. Clips without a reliable seam report that their
+edges were blended. Clips without sufficiently confident, still ankle
+observations report that foot locking was skipped.
+On an attached Kinect One walk-in-place sample, 142 of 150 frames had the
+complete body skeleton. A 135-frame edited loop selected a seam with a
+3.7 mm hip gap and held a planted foot in 258 foot-frames. This is a
+single-sample check; review repeated playback for foot slide and visible pops.
+The editor uses a temporary file and bounded working memory;
+its output needs enough free disk space for the staged and final clip.
+Open clip previews `.rmclip` or JSONL in the 3D stage with a sparse file
+index (one offset per 30 frames), so scrubbing does not load the recording
+into the live preview buffer. Source video is not embedded in pose clips.
+
+Long recordings stream compact `.rmclip` (default), optional JSONL, and BVH
+rows to disk. The compact format starts with `RMC1` and stores each frame as
+a 32-bit little-endian compressed-byte count followed by Qt `qCompress` data
+(zlib plus the uncompressed length). It can be decoded frame by frame and
+exported as JSONL in the editor. On one live body capture it used about 39%
+of the JSONL space. Recording shows written size and available disk space and
+stops when less than 128 MiB remains. The preview timeline is
+limited to 60 seconds, 1,800 frames, and 64 MiB, whichever is reached first.
+Recording length does not increase the retained preview or BVH row memory.
+
 Useful non-hardware checks are `--check-mocap-smoothing`,
 `--check-mocap-stage`, `--check-mocap-rig`, `--check-mocap-guidance`,
 `--check-face-model`, and `--check-factory-registration`. Hardware checks
 include `--check-live-preview`, `--check-live-face-dedicated`,
-`--check-live-body-only`, and `--check-live-mocap`. These switches run from
+`--check-live-body-only`, `--check-live-compact`, and `--check-live-mocap`. These switches run from
 the Qt executable and may need a graphical desktop even when they do not
 open a window. On macOS, use the bundle or a CLion Run/Debug configuration;
 running the executable directly from a restricted shell can fail before the

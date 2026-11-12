@@ -1,4 +1,5 @@
 #include "OnnxFaceTracker.hpp"
+#include "OnnxExecutionProvider.hpp"
 
 #include <onnxruntime/onnxruntime_cxx_api.h>
 #include <QJsonArray>
@@ -52,6 +53,7 @@ struct OnnxFaceTracker::Impl {
   std::string inputName,landmarkName,presenceName;
   std::string blendInputName,blendOutputName;
   QString error;
+  QString provider,blendProvider;
   float cropCx=0,cropCy=0,cropSide=0;
   float cropRoll=0;
   bool hasCrop=false;
@@ -60,15 +62,7 @@ struct OnnxFaceTracker::Impl {
 
 OnnxFaceTracker::OnnxFaceTracker(const QString& path):impl_(std::make_unique<Impl>()) {
   try {
-    Ort::SessionOptions options;
-    options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    options.SetIntraOpNumThreads(2);
-#ifdef Q_OS_WIN
-    const std::wstring nativePath=path.toStdWString();
-    impl_->session=std::make_unique<Ort::Session>(impl_->env,nativePath.c_str(),options);
-#else
-    impl_->session=std::make_unique<Ort::Session>(impl_->env,path.toUtf8().constData(),options);
-#endif
+    impl_->session=remold::createOnnxSession(impl_->env,path,2,"REMOLD_ONNX_FACE_PROVIDER",&impl_->provider);
     if(impl_->session->GetInputCount()!=1||impl_->session->GetOutputCount()<2)
       throw std::runtime_error("Unexpected face model input/output count");
     Ort::AllocatorWithDefaultOptions allocator;
@@ -94,12 +88,7 @@ OnnxFaceTracker::OnnxFaceTracker(const QString& path):impl_(std::make_unique<Imp
        presence.GetElementType()!=ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
       throw std::runtime_error("Expected FLOAT face landmarks and presence logit");
     const QString blendPath=QFileInfo(path).dir().filePath("face-blendshapes.onnx");
-#ifdef Q_OS_WIN
-    const std::wstring blendNative=blendPath.toStdWString();
-    impl_->blendSession=std::make_unique<Ort::Session>(impl_->env,blendNative.c_str(),options);
-#else
-    impl_->blendSession=std::make_unique<Ort::Session>(impl_->env,blendPath.toUtf8().constData(),options);
-#endif
+    impl_->blendSession=remold::createOnnxSession(impl_->env,blendPath,2,"REMOLD_ONNX_FACE_PROVIDER",&impl_->blendProvider);
     if(impl_->blendSession->GetInputCount()!=1||impl_->blendSession->GetOutputCount()!=1)
       throw std::runtime_error("Unexpected face blendshape model inputs/outputs");
     impl_->blendInputName=impl_->blendSession->GetInputNameAllocated(0,allocator).get();
@@ -120,6 +109,8 @@ OnnxFaceTracker::OnnxFaceTracker(const QString& path):impl_(std::make_unique<Imp
 OnnxFaceTracker::~OnnxFaceTracker()=default;
 bool OnnxFaceTracker::ready() const {return bool(impl_->session);}
 QString OnnxFaceTracker::error() const {return impl_->error;}
+QString OnnxFaceTracker::provider() const {return impl_->provider==impl_->blendProvider?
+    impl_->provider:impl_->provider+" / "+impl_->blendProvider;}
 
 QJsonObject OnnxFaceTracker::track(const QImage& image,
     const std::array<BodyKeypoint,17>& body,QImage* annotated) {

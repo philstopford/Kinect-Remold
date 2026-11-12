@@ -12,7 +12,7 @@ QByteArray offset(const QVector3D& u) {
 
 bool MocapBvh::start(const QString& path) {
   if(active_) stop();
-  rows_.clear();first_=last_=0;error_.clear();
+  frames_=0;frameCountOffset_=frameTimeOffset_=0;first_=last_=0;error_.clear();
   file_.setFileName(path);
   if(!file_.open(QIODevice::WriteOnly)) {error_=file_.errorString();return false;}
   active_=true;return true;
@@ -32,15 +32,27 @@ QVector3D MocapBvh::eulerZxy(QQuaternion q) {
 
 void MocapBvh::append(const HumanoidPose& pose) {
   if(!active_||!pose.tracked) return;
-  if(rows_.isEmpty()) for(int i=1;i<HumanoidPose::count;++i)
-    offsets_[i]=pose.bones[i].localPosition;
+  if(frames_==0) {
+    for(int i=1;i<HumanoidPose::count;++i)offsets_[i]=pose.bones[i].localPosition;
+    QByteArray header="HIERARCHY\n";joint(header,0,0);
+    header+="MOTION\nFrames: ";frameCountOffset_=header.size();
+    header+=QByteArray(20,'0');header+="\nFrame Time: ";
+    frameTimeOffset_=header.size();header+=QByteArray(18,' ');header+='\n';
+    if(file_.write(header)!=header.size()) {
+      error_=file_.errorString();file_.cancelWriting();active_=false;return;
+    }
+  }
   QByteArray row;const QVector3D root=pose.bones[0].position;
   row+=offset(root);
   for(const HumanoidBone& bone:pose.bones) {
     const QVector3D angles=eulerZxy(bone.localRotation);
     row+=" "+number(angles.x())+" "+number(angles.y())+" "+number(angles.z());
   }
-  row+='\n';rows_.append(row);
+  row+='\n';
+  if(file_.write(row)!=row.size()) {
+    error_=file_.errorString();file_.cancelWriting();active_=false;return;
+  }
+  ++frames_;
   if(first_==0) first_=pose.time;last_=pose.time;
 }
 
@@ -69,16 +81,15 @@ void MocapBvh::joint(QByteArray& out,int bone,int depth) const {
 }
 
 bool MocapBvh::stop() {
-  if(!active_) return true;
+  if(!active_) return error_.isEmpty();
   active_=false;
-  if(rows_.isEmpty()) {file_.cancelWriting();return true;}
-  QByteArray header="HIERARCHY\n";joint(header,0,0);
-  const double frameTime=rows_.size()>1&&last_>first_?
-      (last_-first_)/double(rows_.size()-1):1.0/30.0;
-  header+="MOTION\nFrames: "+QByteArray::number(rows_.size())+"\nFrame Time: "+
-      QByteArray::number(frameTime,'f',6)+"\n";
-  if(file_.write(header)!=header.size()) {error_=file_.errorString();file_.cancelWriting();return false;}
-  for(const QByteArray& row:rows_) if(file_.write(row)!=row.size()) {
+  if(frames_==0) {file_.cancelWriting();return true;}
+  const double frameTime=frames_>1&&last_>first_?
+      (last_-first_)/double(frames_-1):1.0/30.0;
+  const QByteArray count=QByteArray::number(frames_).rightJustified(20,'0');
+  const QByteArray timing=QByteArray::number(frameTime,'f',9).rightJustified(18,' ');
+  if(!file_.seek(frameCountOffset_)||file_.write(count)!=count.size()||
+     !file_.seek(frameTimeOffset_)||file_.write(timing)!=timing.size()) {
     error_=file_.errorString();file_.cancelWriting();return false;
   }
   if(!file_.commit()) {error_=file_.errorString();return false;}

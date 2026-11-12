@@ -1,4 +1,5 @@
 #include "OnnxBodyTracker.hpp"
+#include "../OnnxExecutionProvider.hpp"
 
 #include <onnxruntime/onnxruntime_cxx_api.h>
 #include <QPainter>
@@ -16,6 +17,7 @@ struct OnnxBodyTracker::Impl {
   Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "KinectRemoldQt"};
   std::unique_ptr<Ort::Session> session;
   QString error;
+  QString provider;
   std::string inputName, outputName;
   int inputSize = 0;
   bool rgba8 = false;
@@ -24,14 +26,7 @@ struct OnnxBodyTracker::Impl {
 
 OnnxBodyTracker::OnnxBodyTracker(const QString& modelPath) : impl_(std::make_unique<Impl>()) {
   try {
-    Ort::SessionOptions options;
-    options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-#ifdef _WIN32
-    const std::wstring nativePath = modelPath.toStdWString();
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, nativePath.c_str(), options);
-#else
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, modelPath.toUtf8().constData(), options);
-#endif
+    impl_->session=remold::createOnnxSession(impl_->env,modelPath,0,"REMOLD_ONNX_BODY_PROVIDER",&impl_->provider);
     Ort::AllocatorWithDefaultOptions allocator;
     impl_->inputName = impl_->session->GetInputNameAllocated(0, allocator).get();
     impl_->outputName = impl_->session->GetOutputNameAllocated(0, allocator).get();
@@ -67,6 +62,7 @@ OnnxBodyTracker::OnnxBodyTracker(const QString& modelPath) : impl_(std::make_uni
 OnnxBodyTracker::~OnnxBodyTracker() = default;
 bool OnnxBodyTracker::ready() const { return bool(impl_->session); }
 QString OnnxBodyTracker::error() const { return impl_->error; }
+QString OnnxBodyTracker::provider() const { return impl_->provider; }
 std::array<BodyKeypoint, 17> OnnxBodyTracker::keypoints() const { return impl_->points; }
 
 QImage OnnxBodyTracker::annotate(const QImage& image) {
