@@ -89,6 +89,7 @@
 #include "OnnxFaceTracker.hpp"
 #include "SynSkeletonTracker.hpp"
 #include "RgbdRegistration.hpp"
+#include "ArticulatedPoseFit.hpp"
 #endif
 
 namespace {
@@ -2640,6 +2641,7 @@ class MotionCaptureWindow : public QMainWindow {
     if(!bodyOn)calibrationList_->setCurrentRow(3);
     else if(!faceOn)calibrationList_->setCurrentRow(0);
     smoother_.reset();
+    bodyFit_.reset();
     smoother_.setStability(stability_->value());
     history_.clear();timeline_->setRange(0,0);live_=true;playing_=false;
     faceFrames_=0;fullBodyFrames_=0;maxPoseBytes_=0;
@@ -2665,7 +2667,7 @@ class MotionCaptureWindow : public QMainWindow {
     });
     connect(worker_,&StreamWorker::poseReady,this,[this](const QByteArray& rawPose){
       const QJsonObject rawRoot=QJsonDocument::fromJson(rawPose).object();
-      QJsonObject root=smoother_.filter(rawRoot);
+      QJsonObject root=bodyFit_.fit(smoother_.filter(rawRoot));
       const bool tracked=root.value("tracked").toBool();
       if(root.value("face").toObject().value("tracked").toBool())++faceFrames_;
       QJsonObject face=root.value("face").toObject();
@@ -3188,6 +3190,7 @@ class MotionCaptureWindow : public QMainWindow {
   QLabel* status_=nullptr;QPushButton* recordButton_=nullptr;QPushButton* bvhButton_=nullptr;
   StreamWorker* worker_=nullptr;MocapNetwork network_;MocapWebSocket web_;MocapRig rig_;MocapBvh bvh_;QSaveFile file_;
   MocapPoseSmoother smoother_;
+  ArticulatedPoseFit bodyFit_;
   LanPoseLink lan_;QHash<QString,QByteArray> remotePoses_;
   QString selectedSensor_="local";QImage lastFrame_;
   std::deque<QByteArray> history_;QTimer playback_;bool live_=true,playing_=false;
@@ -3734,6 +3737,34 @@ int main(int argc, char** argv) {
     fprintf(stderr,"Smoothing: still ratio %.3f, spike %.3f, motion %.3f\n",
             filteredVariation/rawVariation,spike-previous,following);
     return following>.75?0:3;
+  }
+  if (app.arguments().contains("--check-articulated-fit")) {
+    ArticulatedPoseFit fit;
+    auto frame=[&](int index,double elbowNoise) {
+      QJsonObject joints;
+      const char* names[]{"shoulderL","shoulderR","elbowL","elbowR",
+          "wristL","wristR","hipL","hipR","kneeL","kneeR","ankleL","ankleR"};
+      const QVector3D points[]{
+          {-.2f,0,2},{.2f,0,2},{-.2f,.3f,2},{.2f,.3f,2},
+          {-.2f,.57f,2},{.2f,.57f,2},{-.15f,.48f,2},{.15f,.48f,2},
+          {-.15f,.9f,2},{.15f,.9f,2},{-.15f,1.32f,2},{.15f,1.32f,2}};
+      for(int i=0;i<12;++i) {
+        QVector3D p=points[i];if(i==2)p.setY(p.y()+float(elbowNoise));
+        joints[names[i]]=QJsonObject{{"p",QJsonArray{p.x(),p.y(),p.z()}},
+            {"uv",QJsonArray{.5,.5}},{"c",.9}};
+      }
+      return fit.fit(QJsonObject{{"device","test"},{"t",1.+index/30.},
+          {"bodies",QJsonArray{QJsonObject{{"id",1},{"joints",joints}}}}});
+    };
+    for(int i=0;i<35;++i)frame(i,0);
+    const QJsonObject fitted=frame(35,.12).value("bodies").toArray()[0].toObject()
+        .value("joints").toObject();
+    auto pos=[&](const char* name){const QJsonArray p=fitted.value(name).toObject().value("p").toArray();
+      return QVector3D(p[0].toDouble(),p[1].toDouble(),p[2].toDouble());};
+    const float upper=(pos("shoulderL")-pos("elbowL")).length();
+    const float lower=(pos("elbowL")-pos("wristL")).length();
+    fprintf(stderr,"Articulated fit: upper %.4f lower %.4f\n",upper,lower);
+    return std::abs(upper-.30f)<.025f&&std::abs(lower-.27f)<.025f?0:2;
   }
   if (app.arguments().contains("--check-mocap-rig")) {
     QJsonObject joints;

@@ -89,14 +89,16 @@ filter improved the export.
 
 ### 2. Improve body stability and contact
 
-The current body filter damps independent joints, followed by a rig rotation
-filter. This can still produce limb-length changes, knee wobble and foot
-lifting when depth samples jump. Add confidence-aware kinematic constraints
-using measured segment lengths, joint limits, and a calibrated floor/contact
-state. Prefer short prediction through occlusion over snapping to a new depth
-sample. Test against held T poses, squats, turns and intentional foot lifts;
-measure both stillness and response lag. Avoid locking feet without explicit
-contact detection.
+The body filter damps individual observations, then `ArticulatedPoseFit` fits
+the connected torso, arms and legs with subject-specific segment lengths.
+Lengths are calibrated from up to 30 plausible observations per segment and
+held fixed for the capture. If a distal segment cannot be measured reliably,
+the fit scales its anatomical proportion from a measured proximal segment.
+The fit weights joint targets by confidence. This
+reduces limb-length changes but does not yet include joint-angle limits or a
+calibrated floor/contact state. Test against held T poses, squats, turns and
+intentional foot lifts; measure both stillness and response lag. Avoid locking
+feet without explicit contact detection.
 
 ### 3. Improve face geometry and expression stability
 
