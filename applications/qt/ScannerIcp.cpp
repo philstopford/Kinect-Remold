@@ -57,27 +57,15 @@ ScannerPose increment(const float d[6]) {
 }
 
 ScannerIcpResult ScannerIcp::align(const QByteArray& current,const QByteArray& reference,
-    const DepthIntrinsics& camera,const DepthCalibrationProfile* calibration,bool turntable) const {
+    const DepthIntrinsics& camera,const DepthCalibrationProfile* calibration,bool turntable,
+    const ScannerPose* initial) const {
   ScannerIcpResult result;
   if(!camera.valid()||current.size()!=qsizetype(camera.width)*camera.height*2||
      reference.size()!=current.size()) return result;
-  // A nearly unchanged scene is safe to integrate without estimating the
-  // underconstrained sideways motion of a flat wall.
-  int same=0,comparable=0;
-  for(int y=8;y<camera.height-8;y+=8) for(int x=8;x<camera.width-8;x+=8) {
-    const auto a=pointAt(current,camera,calibration,x,y);
-    const auto b=pointAt(reference,camera,calibration,x,y);
-    if(a.z()<=0||b.z()<=0) continue;
-    ++comparable;
-    if(std::abs(a.z()-b.z())<.005f) ++same;
-  }
-  if(!turntable && comparable>=200 && same>comparable*.90f) {
-    result.accepted=true;result.matches=same;
-    result.overlap=float(same)/comparable;return result;
-  }
-  ScannerPose estimate;
+  ScannerPose estimate=initial?*initial:ScannerPose{};
   int finalMatches=0,finalSamples=0;
   float finalRms=1;
+  float finalObservability=0;
   for(int level=0;level<3;++level) {
     const int stride=level==0?8:level==1?5:3;
     const float gate=level==0?.09f:level==1?.055f:.035f;
@@ -119,6 +107,9 @@ ScannerIcpResult ScannerIcp::align(const QByteArray& current,const QByteArray& r
         }
       if(matches<100||samples<200||weightSum<=0) break;
       finalMatches=matches;finalSamples=samples;finalRms=float(std::sqrt(squared/weightSum));
+      const double translationSum=A[3][3]+A[4][4]+A[5][5];
+      finalObservability=translationSum>0?float(std::min({A[3][3],A[4][4],A[5][5]})/
+          translationSum):0;
       if(turntable) for(int fixed:{0,2,4}) {
         for(int k=0;k<6;++k) A[fixed][k]=A[k][fixed]=0;
         A[fixed][fixed]=1;A[fixed][6]=0;
@@ -136,6 +127,11 @@ ScannerIcpResult ScannerIcp::align(const QByteArray& current,const QByteArray& r
   result.currentToReference=estimate;
   result.matches=finalMatches;result.overlap=finalSamples?float(finalMatches)/finalSamples:0;
   result.rmsM=finalRms;
-  result.accepted=finalMatches>=120&&result.overlap>=.18f&&finalRms<.025f;
+  result.translationObservability=finalObservability;
+  const QVector3D translation(estimate.m[3],estimate.m[7],estimate.m[11]);
+  const float trace=estimate.m[0]+estimate.m[5]+estimate.m[10];
+  const float angle=std::acos(std::clamp((trace-1)*.5f,-1.f,1.f));
+  result.accepted=finalMatches>=120&&result.overlap>=.18f&&finalRms<.025f&&
+      translation.length()<.20f&&angle<.35f;
   return result;
 }

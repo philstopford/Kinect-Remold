@@ -8,6 +8,7 @@ struct ScannerIcpResult {
   ScannerPose currentToReference;
   float rmsM = 0;
   float overlap = 0;
+  float translationObservability = 0;
   int matches = 0;
   bool accepted = false;
 };
@@ -17,5 +18,5 @@ class ScannerIcp {
   ScannerIcpResult align(const QByteArray& current, const QByteArray& reference,
                          const DepthIntrinsics& camera,
                          const DepthCalibrationProfile* calibration,
-                         bool turntable = false) const;
+                         bool turntable = false,const ScannerPose* initial = nullptr) const;
 };

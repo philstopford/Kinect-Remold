@@ -12,6 +12,7 @@
 #include <QPointF>
 #include <QSaveFile>
 #include <QTemporaryFile>
+#include <QTemporaryDir>
 #include <QVector3D>
 #include <algorithm>
 #include <array>
@@ -350,6 +351,105 @@ bool writeFrame(QIODevice& file,const QJsonObject& frame) {
 MocapClipResult MocapClipProcessor::process(const MocapClipOptions& opt) {
   MocapClipResult result;
   if(opt.source.isEmpty()||opt.output.isEmpty()) {result.error="Select source and output files";return result;}
+  if(opt.splitTracks) {
+    QFile probe(opt.source);
+    if(!probe.open(QIODevice::ReadOnly)){result.error=probe.errorString();return result;}
+    const QJsonObject sample=readFrame(probe);
+    if(sample.isEmpty()){result.error="No readable pose frames";return result;}
+    const QJsonArray tracks=sample.value("tracks").toArray();
+    if(!tracks.isEmpty()) {
+      QTemporaryDir directory(QFileInfo(opt.output).absolutePath()+"/.remold-tracks-XXXXXX");
+      if(!directory.isValid()){result.error="Cannot create track staging directory";return result;}
+      std::vector<QString> ids,sensors,inputs,outputs;
+      std::vector<std::unique_ptr<QFile>> writers;
+      for(int i=0;i<tracks.size();++i) {
+        const QJsonObject track=tracks[i].toObject();
+        ids.push_back(track.value("id").toString(QString("person-%1").arg(i+1)));
+        sensors.push_back(track.value("sensor").toString());
+        inputs.push_back(directory.filePath(QString("input-%1.jsonl").arg(i)));
+        outputs.push_back(directory.filePath(QString("output-%1.jsonl").arg(i)));
+        auto file=std::make_unique<QFile>(inputs.back());
+        if(!file->open(QIODevice::WriteOnly)){result.error=file->errorString();return result;}
+        writers.push_back(std::move(file));
+      }
+      probe.seek(0);probe.setProperty("compact",QVariant());
+      auto frame=readFrame(probe);
+      while(!frame.isEmpty()) {
+        const QJsonArray row=frame.value("tracks").toArray();
+        for(int i=0;i<int(writers.size());++i) {
+          const QJsonObject track=i<row.size()?row[i].toObject():QJsonObject{};
+          QJsonObject single{{"v",1},{"device",sensors[size_t(i)]},
+              {"t",frame.value("t")},{"frame",frame.value("frame")},
+              {"space",track.value("space").toString("camera")},{"tracked",track.value("tracked")},
+              {"observed",track.value("observed")},{"bodies",track.value("bodies")},
+              {"face",track.value("face")}};
+          if(!writeFrame(*writers[size_t(i)],single)) {
+            result.error=writers[size_t(i)]->errorString();return result;
+          }
+        }
+        frame=readFrame(probe);
+      }
+      if(probe.property("decodeError").isValid()){
+        result.error=probe.property("decodeError").toString();return result;
+      }
+      writers.clear();
+      int reference=-1;
+      for(int i=0;i<int(ids.size());++i)
+        if(opt.selectedTracks.isEmpty()||opt.selectedTracks.contains(ids[size_t(i)])) {reference=i;break;}
+      if(reference<0){result.error="Selected person is not in this clip";return result;}
+      std::vector<MocapClipResult> edited(ids.size());
+      auto runTrack=[&](int i,int forcedStart,int forcedEnd) {
+        MocapClipOptions child=opt;
+        child.source=inputs[size_t(i)];child.output=outputs[size_t(i)];
+        child.face=(opt.selectedTracks.size()==1?
+            opt.selectedTracks.contains(ids[size_t(i)]):i==0)?opt.face:QString{};
+        child.bvhOutput.clear();child.splitTracks=false;
+        child.forcedSeamStart=forcedStart;child.forcedSeamEnd=forcedEnd;
+        if(!opt.selectedTracks.isEmpty()&&!opt.selectedTracks.contains(ids[size_t(i)]))
+          child.smoothing=0;
+        return MocapClipProcessor::process(child);
+      };
+      edited[size_t(reference)]=runTrack(reference,-1,-1);
+      if(!edited[size_t(reference)].error.isEmpty())return edited[size_t(reference)];
+      for(int i=0;i<int(ids.size());++i)if(i!=reference) {
+        edited[size_t(i)]=runTrack(i,opt.loopBlend>0?edited[size_t(reference)].seamStartFrame:-1,
+            opt.loopBlend>0?edited[size_t(reference)].seamEndFrame:-1);
+        if(!edited[size_t(i)].error.isEmpty())return edited[size_t(i)];
+        if(edited[size_t(i)].frames!=edited[size_t(reference)].frames) {
+          result.error="Track processing produced different frame counts";return result;
+        }
+      }
+      std::vector<std::unique_ptr<QFile>> readers;
+      for(const QString& path:outputs) {
+        auto file=std::make_unique<QFile>(path);
+        if(!file->open(QIODevice::ReadOnly)){result.error=file->errorString();return result;}
+        readers.push_back(std::move(file));
+      }
+      QSaveFile output(opt.output);
+      if(!output.open(QIODevice::WriteOnly)){result.error=output.errorString();return result;}
+      const bool compact=opt.output.endsWith(".rmclip",Qt::CaseInsensitive);
+      output.setProperty("compact",compact);
+      if(compact&&output.write("RMC1",4)!=4){result.error=output.errorString();return result;}
+      for(int n=0;n<edited[size_t(reference)].frames;++n) {
+        QJsonArray row;QJsonObject combined;
+        for(int i=0;i<int(readers.size());++i) {
+          const QJsonObject single=readFrame(*readers[size_t(i)]);
+          if(single.isEmpty()){result.error="Processed track ended early";return result;}
+          if(i==0)combined=single;
+          row.append(QJsonObject{{"id",ids[size_t(i)]},{"sensor",sensors[size_t(i)]},
+              {"space",single.value("space")},
+              {"tracked",single.value("tracked")},{"observed",single.value("observed")},
+              {"bodies",single.value("bodies")},{"face",single.value("face")}});
+        }
+        combined["tracks"]=row;
+        if(!writeFrame(output,combined)){result.error=output.errorString();return result;}
+      }
+      if(!output.commit()){result.error=output.errorString();return result;}
+      result=edited[size_t(reference)];
+      result.warning="Processed synchronized person tracks";
+      return result;
+    }
+  }
   QFile source(opt.source);if(!source.open(QIODevice::ReadOnly)){result.error=source.errorString();return result;}
   QFile face(opt.face);
   if(!opt.face.isEmpty()&&!face.open(QIODevice::ReadOnly)){result.error=face.errorString();return result;}
@@ -444,7 +544,20 @@ MocapClipResult MocapClipProcessor::process(const MocapClipOptions& opt) {
     }
   }
   int startIndex=0,endIndex=result.frames-1;
-  if(loop) {
+  if(loop&&opt.forcedSeamStart>=0&&opt.forcedSeamEnd>=0) {
+    startIndex=opt.forcedSeamStart;endIndex=opt.forcedSeamEnd;
+    if(startIndex+overlap>=int(frontSignatures.size())||endIndex>=result.frames||
+       endIndex-startIndex<=overlap*2+1) {
+      result.error="Shared loop seam is outside this track";output.cancelWriting();return result;
+    }
+    result.seamStartFrame=startIndex;result.seamEndFrame=endIndex;
+    firstTime=frontSignatures[size_t(startIndex)].time;
+    firstRoot=frontSignatures[size_t(startIndex)].root;
+    for(const PoseSignature& ending:tailSignatures)if(ending.index==endIndex) {
+      lastTime=ending.time;lastRoot=ending.root;break;
+    }
+    result.frames=endIndex-startIndex+1;
+  } else if(loop) {
     double best=1e9;
     const int candidateWindow=std::min(120,std::max(30,result.frames/4));
     const int startCandidates=std::min({candidateWindow,

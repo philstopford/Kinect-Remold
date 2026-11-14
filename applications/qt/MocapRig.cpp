@@ -118,7 +118,10 @@ HumanoidPose MocapRig::retarget(const QByteArray& cameraJson,bool mirror) {
   const QJsonObject face=root.value("face").toObject();
   const QJsonArray facePoints=face.value("landmarks").toArray();
   bool faceRollObserved=false;
-  if(face.value("tracked").toBool()&&face.value("confidence").toDouble()>.6&&
+  if(face.value("tracked").toBool()&&
+     (face.value("sourceSensor").toString().isEmpty()||
+      face.value("sourceSensor").toString()==root.value("device").toString())&&
+     face.value("confidence").toDouble()>.6&&
      facePoints.size()==478) {
     const QJsonArray eyeLeft=facePoints[33].toArray(),eyeRight=facePoints[263].toArray();
     if(eyeLeft.size()==3&&eyeRight.size()==3) {

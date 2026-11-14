@@ -25,6 +25,18 @@ only when the model and metric depth observed them. The 3D stage is in camera
 metres; it is not a calibrated multi-sensor room view.
 Starting a camera stream in another window hands that sensor to the latest
 window automatically. A message in the previous window reports the handoff.
+For one person per sensor, use **New sensor capture window**, choose a different
+camera in each window, and configure separate output ports or recording files.
+Each window has its own face crop, body tracking, smoothing, calibration, and
+recording state. For a single person seen by several cameras, enable
+**Observe all local sensors** on the Sensors & LAN tab before starting tracking.
+The other cameras then run independent local trackers; select their sensor rows
+to inspect live video and raw poses. The selected capture camera remains the
+source for the quality marker, timeline, streams, and recordings. This view can
+help place a second camera where head turns or pitch hide the face from the
+first camera. It does not merge faces or joints across cameras: the observed
+poses remain in their respective camera coordinate systems. Disable the
+observer option when using separate capture windows for those cameras.
 Motion Capture applies confidence-aware joint smoothing with a small hold zone
 for stationary joints and limits single-frame position jumps before drawing,
 retargeting, streaming, or recording a pose. Deliberate movement is followed

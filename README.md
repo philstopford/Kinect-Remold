@@ -219,28 +219,26 @@ Windows and Linux recording uses FFmpeg from the application directory or `PATH`
 macOS recording uses AVFoundation.
 The Qt Surveillance window monitors ready cameras independently, changes to
 infrared in darkness, detects motion, and records indexed MJPEG AVI event files
-per camera with up to 60 seconds of pre-roll. The Qt Microphones window captures
-and records the four-channel Remold PCM endpoint where a driver advertises audio;
-it shows per-channel levels and
-exposes the driver's volume and mute controls. It also estimates sound direction
-from microphone timing and can record a mono delay-and-sum beam. The Qt Acoustic
-Scanner shows an azimuth and an accumulating direction map from the same
-four-channel input.
+per camera with up to 60 seconds of pre-roll. Qt Motion Capture records available
+four-channel Kinect CoreAudio inputs as separate WAV files beside the motion clip;
+its sensor audio list lets the user include either microphone array or neither.
 The Qt Sensor Calibration window captures flat-wall depth stations, evaluates
 an independent validation capture, and saves a per-device correction. Saved
 corrections are applied to Qt PLY and OBJ depth exports. Keep the validation
 wall at a different distance from the training wall when possible.
 The Qt 3D Scanner window now integrates calibrated metric depth into a TSDF,
-tracks camera motion with point-to-plane ICP, expands its volume as needed,
-shows an orbitable mesh preview after capture, and exports the fused surface as
-OBJ, binary PLY, or binary STL. The longer live check on the attached Kinect
-One integrated 30 depth frames without tracking rejection. Turntable-specific
-capture now isolates a central depth band, removes a detected support plane,
+tracks full camera motion from registered RGB features and point-to-plane depth ICP,
+expands its volume as needed,
+shows an orbitable mesh preview during capture, and exports the fused surface as
+vertex-colored OBJ or binary PLY. The longer live check on the attached Kinect
+One integrated 30 depth frames without tracking rejection. Both Qt modes isolate
+a central foreground depth band. Turntable capture also removes a detected support plane,
 constrains ICP to yaw and in-plane translation, and reports accumulated sweep.
 Kinect One now accumulates factory-registered RGB near the TSDF surface and
 exports vertex colors in PLY and OBJ. A 30-frame live capture produced 51,494
-triangles, 43,253 with color. Loop closure and Refine HQ remain to be ported
-from the Java scanner. STL carries geometry only.
+triangles, 43,253 with color. Loop closure, UV texture atlases, and Refine HQ
+remain to be ported from the Java scanner. Hands must leave the capture region;
+the Qt scanner does not segment them automatically.
 Build the Qt frontend directly on Linux with `scripts/linux/BUILD-QT.sh` or on
 Windows with `scripts/windows/Build-Qt.ps1` in PowerShell. These entry points
 require Qt 6.4+, the Qt WebSockets module, ONNX Runtime and CMake; the Windows script also uses `windeployqt`. They

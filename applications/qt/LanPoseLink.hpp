@@ -6,8 +6,7 @@
 #include <QHash>
 #include <QUrl>
 
-// Mutual-TLS observation transport. Remote observations are preview-only until
-// room calibration and clock uncertainty satisfy the fusion contract.
+// Mutual-TLS transport for camera-space body and face observations.
 class LanPoseLink : public QObject {
   Q_OBJECT
  public:
@@ -21,6 +20,7 @@ class LanPoseLink : public QObject {
   void stop();
   QString error() const {return error_;}
   quint16 port() const {return server_.serverPort();}
+  bool hosting() const {return server_.isListening();}
   int connectedPeers() const;
  signals:
   void remotePose(QString sensor,QByteArray cameraPose);

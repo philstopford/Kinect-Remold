@@ -56,6 +56,8 @@ QByteArray facePacket(const QJsonObject& root,const QJsonObject& face) {
     append16((p[2].toDouble()+1.)*.5);
   }
   return QJsonDocument(QJsonObject{{"v",1},{"kind","face-landmarks"},
+      {"person",root.value("person")},
+      {"sourceSensor",face.value("sourceSensor")},
       {"device",root.value("device")},{"t",root.value("t")},
       {"frame",root.value("frame")},{"confidence",face.value("confidence")},
       {"format","u16le-uvz"},{"count",478},
@@ -160,21 +162,31 @@ bool MocapNetwork::send(const QByteArray& poseJson,const HumanoidPose* rig,
   if(jsonEnabled_) {
     const QByteArray& payload=jsonOutput.isEmpty()?poseJson:jsonOutput;
     QJsonObject root=QJsonDocument::fromJson(payload).object();
-    const QJsonObject face=root.value("face").toObject();
-    QByteArray bodyPayload=payload;
-    if(!face.isEmpty()) {
-      root.remove("face");
-      bodyPayload=QJsonDocument(root).toJson(QJsonDocument::Compact);
-    }
-    if(socket_.writeDatagram(bodyPayload,jsonHost_,jsonPort_)!=bodyPayload.size())
-      error_=socket_.errorString();
-    else ++jsonPackets_;
-    if(!face.isEmpty()) {
-      const QByteArray compact=facePacket(root,face);
-      if(compact.isEmpty())error_="Invalid facial landmark packet";
-      else if(socket_.writeDatagram(compact,jsonHost_,jsonPort_)!=compact.size())
+    const QJsonArray tracks=root.value("tracks").toArray();
+    auto sendPerson=[&](QJsonObject frame) {
+      const QJsonObject face=frame.value("face").toObject();
+      frame.remove("face");frame.remove("tracks");
+      const QByteArray bodyPayload=QJsonDocument(frame).toJson(QJsonDocument::Compact);
+      if(socket_.writeDatagram(bodyPayload,jsonHost_,jsonPort_)!=bodyPayload.size())
         error_=socket_.errorString();
       else ++jsonPackets_;
+      if(face.value("tracked").toBool()) {
+        const QByteArray compact=facePacket(frame,face);
+        if(compact.isEmpty())error_="Invalid facial landmark packet";
+        else if(socket_.writeDatagram(compact,jsonHost_,jsonPort_)!=compact.size())
+          error_=socket_.errorString();
+        else ++jsonPackets_;
+      }
+    };
+    if(tracks.isEmpty())sendPerson(root);
+    else for(const QJsonValue& value:tracks) {
+      const QJsonObject track=value.toObject();
+      QJsonObject frame{{"v",1},{"person",track.value("id")},
+          {"device",track.value("sensor")},{"t",root.value("t")},
+          {"frame",root.value("frame")},{"space",track.value("space")},
+          {"tracked",track.value("tracked")},{"observed",track.value("observed")},
+          {"bodies",track.value("bodies")},{"face",track.value("face")}};
+      sendPerson(frame);
     }
   }
   if(oscEnabled_) {

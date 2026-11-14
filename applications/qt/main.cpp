@@ -1,4 +1,6 @@
 #include <QApplication>
+#include <QAudioSource>
+#include <QMediaDevices>
 #include <QBuffer>
 #include <QCheckBox>
 #include <QCoreApplication>
@@ -16,6 +18,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QImage>
+#include <QIODevice>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -36,6 +39,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSignalBlocker>
 #include <QScrollArea>
 #include <QSlider>
 #include <QSpinBox>
@@ -56,6 +60,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <vector>
 #ifndef Q_OS_WIN
@@ -68,11 +74,11 @@
 #include "remold/protocol.hpp"
 #include "KinectOneRemoldProtocol.h"
 #include "MotionDetector.hpp"
-#include "SpatialAudio.hpp"
 #include "MjpegAviWriter.hpp"
 #include "DepthCalibration.hpp"
 #include "TsdfVolume.hpp"
 #include "ScannerIcp.hpp"
+#include "ScannerVisualTracker.hpp"
 #include "ScannerMeshWriter.hpp"
 #include "ScannerSegmentation.hpp"
 #include "MocapNetwork.hpp"
@@ -100,7 +106,7 @@
 namespace {
 
 struct Device {
-  QString id, label, generation, state, control, camera, audio, audioControl, sdk;
+  QString id, label, generation, state, control, camera, sdk;
 };
 
 QString calibrationPath(const QString& deviceId);
@@ -198,7 +204,6 @@ std::vector<Device> discoverAt(const QString& path) {
     d.id = QString::fromUtf8(fields[0]); d.label = QString::fromUtf8(fields[1]);
     d.state = QString::fromUtf8(fields[2]); d.control = QString::fromUtf8(fields[3]);
     d.camera = QString::fromUtf8(fields[4]);
-    d.audio = QString::fromUtf8(fields[5]); d.audioControl = QString::fromUtf8(fields[6]);
     d.sdk = QString::fromUtf8(fields[8]); d.generation = QString::fromUtf8(fields[10]);
     found.push_back(std::move(d));
   }
@@ -250,31 +255,6 @@ QString tiltAt(const Device& device, int degrees) {
     return QStringLiteral("Invalid motor response");
   if (reply.result != 0) return QStringLiteral("Motor error %1").arg(reply.result);
   return QStringLiteral("Tilt set to %1°").arg(degrees);
-}
-
-QString audioControlAt(const Device& device, remold::audio_control::Command command, int value) {
-  if (device.audioControl.isEmpty()) return QStringLiteral("Audio control is unavailable");
-  QLocalSocket socket;
-  socket.connectToServer(device.audioControl);
-  if (!socket.waitForConnected(1000)) return socket.errorString();
-  remold::audio_control::Request request{};
-  request.command = command; request.value = value;
-  if (socket.write(reinterpret_cast<const char*>(&request), sizeof(request)) != sizeof(request) ||
-      !socket.waitForBytesWritten(1000)) return QStringLiteral("Audio control request failed");
-  QByteArray response;
-  QElapsedTimer timeout; timeout.start();
-  while (response.size() < int(sizeof(remold::audio_control::Reply)) && timeout.elapsed() < 2000) {
-    if (socket.bytesAvailable() || socket.waitForReadyRead(250)) response += socket.readAll();
-    else if (socket.state() != QLocalSocket::ConnectedState) break;
-  }
-  if (response.size() != int(sizeof(remold::audio_control::Reply)))
-    return QStringLiteral("Audio control response timed out");
-  remold::audio_control::Reply reply{};
-  std::memcpy(&reply, response.constData(), sizeof(reply));
-  if (reply.magic != remold::audio_control::kMagic || reply.version != remold::audio_control::kVersion)
-    return QStringLiteral("Invalid audio control response");
-  if (reply.result != 0) return QStringLiteral("Audio control error %1").arg(reply.result);
-  return QStringLiteral("Volume %1% · %2").arg(reply.volume).arg(reply.muted ? "muted" : "live");
 }
 
 quint32 u32(const char* p) { quint32 value; std::memcpy(&value, p, sizeof(value)); return value; }
@@ -495,7 +475,7 @@ protected:
       const QString reason=result==KinectOneRemoldProtocol::ResultDeviceBusy?"sensor is busy":
           result==KinectOneRemoldProtocol::ResultDeviceNotFound?"sensor disconnected":
           result==KinectOneRemoldProtocol::ResultStreamingUnavailable?
-              "USB stream startup failed; inspect native-service terminal":
+              "USB stream unavailable; for two Kinect v2 sensors, use separate USB 3 controllers (not one hub)":
           result==KinectOneRemoldProtocol::ResultUnsupported?"unsupported stream request":
           result==999?"incomplete reply":"invalid reply";
       emit message(QString("Cannot start tracking: %1 (code %2)").arg(reason).arg(result));return;
@@ -533,17 +513,22 @@ protected:
     const bool profileMocap=!qEnvironmentVariableIsEmpty("REMOLD_PROFILE_MOCAP");
     double bodyMs=0,handMs=0,faceMs=0,liftMs=0;
     int profileFrames=0;
+    quint64 streamedFrames=0;
+    QString streamFailure;
     while (!isInterruptionRequested()) {
       const QByteArray header = readExact(socket, 76, this);
-      if (header.size() != 76) break;
+      if (header.size() != 76) {streamFailure="camera connection closed";break;}
       const quint32 magic = u32(header.constData());
       const int width = int(u32(header.constData()+12)), height = int(u32(header.constData()+16));
       const quint32 format = u32(header.constData()+20), bytes = u32(header.constData()+24);
       const quint64 frameNumber=u64(header.constData()+32);
       const quint64 frameTick=u64(header.constData()+40);
-      if (magic != 0x46534D52u || bytes > 16u*1024u*1024u) break;
+      if (magic != 0x46534D52u || bytes > 16u*1024u*1024u) {
+        streamFailure="invalid camera frame header";break;
+      }
       const QByteArray payload = readExact(socket, bytes, this);
-      if (payload.size() != bytes) break;
+      if (payload.size() != bytes) {streamFailure="camera frame payload ended early";break;}
+      ++streamedFrames;
       if (nativeDepth && format == KinectOneRemoldProtocol::DepthMm16 &&
           payload.size() == qsizetype(width) * height * 2) {
         latestDepth=payload;
@@ -730,396 +715,14 @@ protected:
       }
       if (!image.isNull() && (overlay_<5 || overlay_>7)) emit frameReady(image);
     }
-    emit message("Stream stopped");
+    emit message(isInterruptionRequested()?"Stream stopped":
+        QString("USB stream ended after %1 frames (%2). Check the sensor's USB 3 controller, hub, and power.")
+            .arg(streamedFrames).arg(streamFailure));
   }
 private:
   Device device_;
   quint32 mask_;
   int overlay_;
-};
-
-class AudioWorker : public QThread {
-  Q_OBJECT
- public:
-  explicit AudioWorker(Device device, QObject* parent = nullptr) : QThread(parent), device_(std::move(device)) {}
- signals:
-  void audioReady(QByteArray samples, QByteArray beam, QVector<int> levels,
-                  float azimuthDeg, float confidence, float rms);
-  void message(QString text);
- protected:
-  void run() override {
-    QLocalSocket socket;
-    socket.connectToServer(device_.audio);
-    if (!socket.waitForConnected(2000)) { emit message(socket.errorString()); return; }
-    remold::audio::Request request{};
-    if (socket.write(reinterpret_cast<const char*>(&request), sizeof(request)) != sizeof(request) ||
-        !socket.waitForBytesWritten(2000)) { emit message("Audio request failed"); return; }
-    const QByteArray replyBytes = readExact(socket, sizeof(remold::audio::Reply), this);
-    if (replyBytes.size() != sizeof(remold::audio::Reply)) { emit message("Audio reply timed out"); return; }
-    remold::audio::Reply reply{};
-    std::memcpy(&reply, replyBytes.constData(), sizeof(reply));
-    if (reply.magic != remold::audio::kMagic || reply.version != remold::audio::kVersion ||
-        reply.result != 0 || reply.sampleRate != 16000 || reply.channels != 4 ||
-        reply.sampleFormat != remold::audio::SampleFormat::PcmS32Le) {
-      emit message("Audio transport rejected four-channel PCM"); return;
-    }
-    emit message("Capturing four-channel audio from " + device_.label);
-    SpatialAudio spatial;
-    while (!isInterruptionRequested()) {
-      const QByteArray headerBytes = readExact(socket, sizeof(remold::audio::FrameHeader), this);
-      if (headerBytes.size() != sizeof(remold::audio::FrameHeader)) break;
-      remold::audio::FrameHeader header{};
-      std::memcpy(&header, headerBytes.constData(), sizeof(header));
-      if (header.magic != remold::audio::kFrameMagic || header.version != remold::audio::kVersion ||
-          header.sampleRate != 16000 || header.channels != 4 ||
-          header.sampleFormat != remold::audio::SampleFormat::PcmS32Le ||
-          header.samplesPerChannel != remold::audio::kSamples ||
-          header.payloadBytes != header.samplesPerChannel * 16) {
-        emit message("Invalid audio frame"); break;
-      }
-      const QByteArray samples = readExact(socket, header.payloadBytes, this);
-      if (samples.size() != header.payloadBytes) break;
-      double squared[4]{};
-      for (quint32 i = 0; i < header.samplesPerChannel; ++i) for (int channel = 0; channel < 4; ++channel) {
-        qint32 sample;
-        std::memcpy(&sample, samples.constData() + (i * 4 + channel) * 4, sizeof(sample));
-        const double normalized = double(sample) / 2147483648.0;
-        squared[channel] += normalized * normalized;
-      }
-      QVector<int> levels(4);
-      for (int channel = 0; channel < 4; ++channel)
-        levels[channel] = (header.channelMask & (1u << channel)) ?
-            int(std::clamp(std::sqrt(squared[channel] / header.samplesPerChannel) * 250.0, 0.0, 100.0)) : 0;
-      const SpatialAudioResult scan = spatial.process(samples, header.channelMask);
-      emit audioReady(samples, scan.beamPcm16, levels, scan.azimuthDeg, scan.confidence, scan.rms);
-    }
-    emit message("Audio stopped");
-  }
- private:
-  Device device_;
-};
-
-class MicrophoneWindow : public QMainWindow {
- public:
-  MicrophoneWindow() {
-    setWindowTitle("Kinect Remold — Microphones");
-    resize(620, 420);
-    auto* central = new QWidget(this);
-    auto* layout = new QVBoxLayout(central);
-    devices_ = new QComboBox;
-    layout->addWidget(devices_);
-    auto* controls = new QHBoxLayout;
-    auto* refreshButton = new QPushButton("Refresh");
-    auto* start = new QPushButton("Start capture");
-    auto* stop = new QPushButton("Stop");
-    auto* record = new QPushButton("Record WAV");
-    auto* beamRecord = new QPushButton("Record beam WAV");
-    auto* finish = new QPushButton("Finish recording");
-    controls->addWidget(refreshButton); controls->addWidget(start);
-    controls->addWidget(stop); controls->addWidget(record);
-    controls->addWidget(beamRecord); controls->addWidget(finish);
-    layout->addLayout(controls);
-    for (int channel = 0; channel < 4; ++channel) {
-      auto* row = new QHBoxLayout;
-      row->addWidget(new QLabel(QString("Microphone %1").arg(channel + 1)));
-      meters_[channel] = new QProgressBar;
-      meters_[channel]->setRange(0, 100);
-      row->addWidget(meters_[channel], 1);
-      layout->addLayout(row);
-    }
-    auto* gain = new QHBoxLayout;
-    gain->addWidget(new QLabel("Input volume"));
-    volume_ = new QSlider(Qt::Horizontal);
-    volume_->setRange(0, 100); volume_->setValue(100);
-    gain->addWidget(volume_, 1);
-    mute_ = new QCheckBox("Mute");
-    gain->addWidget(mute_);
-    layout->addLayout(gain);
-    direction_ = new QLabel("Sound direction: —");
-    layout->addWidget(direction_);
-    status_ = new QLabel;
-    layout->addWidget(status_);
-    setCentralWidget(central);
-    connect(refreshButton, &QPushButton::clicked, this, [this] { refresh(); });
-    connect(start, &QPushButton::clicked, this, [this] { startCapture(); });
-    connect(stop, &QPushButton::clicked, this, [this] { stopCapture(); });
-    connect(record, &QPushButton::clicked, this, [this] { startRecording(false); });
-    connect(beamRecord, &QPushButton::clicked, this, [this] { startRecording(true); });
-    connect(finish, &QPushButton::clicked, this, [this] { finishRecording(); });
-    connect(volume_, &QSlider::sliderReleased, this, [this] {
-      if (const Device* device = selected())
-        status_->setText(audioControlAt(*device, remold::audio_control::Command::SetVolume, volume_->value()));
-    });
-    connect(mute_, &QCheckBox::toggled, this, [this](bool muted) {
-      if (const Device* device = selected())
-        status_->setText(audioControlAt(*device, remold::audio_control::Command::SetMute, muted ? 1 : 0));
-    });
-    connect(devices_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-      const Device* device = selected();
-      const bool controllable = device && !device->audioControl.isEmpty();
-      volume_->setEnabled(controllable); mute_->setEnabled(controllable);
-    });
-    auto* timer = new QTimer(this);
-    connect(timer, &QTimer::timeout, this, [this] { if (!worker_) refresh(); });
-    timer->start(2000);
-    refresh();
-  }
-  ~MicrophoneWindow() override { stopCapture(); }
-  int checkLiveAudio() {
-    if (found_.empty()) return 2;
-    startCapture();
-    QElapsedTimer timeout; timeout.start();
-    while (timeout.elapsed() < 5000 && frames_ == 0) {
-      QApplication::processEvents();
-      QThread::msleep(20);
-    }
-    return frames_ > 0 ? 0 : 3;
-  }
- private:
-  const Device* selected() const {
-    const int index = devices_->currentIndex();
-    return index >= 0 && index < int(found_.size()) ? &found_[size_t(index)] : nullptr;
-  }
-  void refresh() {
-    if (worker_) return;
-    const QString id = devices_->currentData().toString();
-    found_ = discoverAt(sdkPath(false));
-    auto one = discoverAt(sdkPath(true)); found_.insert(found_.end(), one.begin(), one.end());
-    found_.erase(std::remove_if(found_.begin(), found_.end(), [](const Device& device) {
-      return device.audio.isEmpty() || device.state != QStringLiteral("Ready");
-    }), found_.end());
-    devices_->clear();
-    for (const Device& device : found_) devices_->addItem(device.label, device.id);
-    const int index = devices_->findData(id);
-    if (index >= 0) devices_->setCurrentIndex(index);
-    status_->setText(found_.empty() ? "No four-channel audio endpoint available" :
-                                   QString("%1 audio device(s) found").arg(found_.size()));
-  }
-  void startCapture() {
-    stopCapture();
-    const Device* device = selected();
-    if (!device) { status_->setText("Select an audio device"); return; }
-    worker_ = new AudioWorker(*device, this);
-    connect(worker_, &AudioWorker::message, status_, &QLabel::setText);
-    connect(worker_, &AudioWorker::audioReady, this,
-            [this](const QByteArray& samples, const QByteArray& beam, const QVector<int>& levels,
-                   float azimuth, float confidence, float) {
-      ++frames_;
-      for (int channel = 0; channel < 4 && channel < levels.size(); ++channel)
-        meters_[channel]->setValue(levels[channel]);
-      direction_->setText(QString("Sound direction: %1° · confidence %2%")
-          .arg(azimuth, 0, 'f', 1).arg(int(confidence * 100)));
-      const QByteArray& output = beamMode_ ? beam : samples;
-      if (recording_ && recording_->write(output) != output.size()) {
-        status_->setText(recording_->errorString()); finishRecording();
-      }
-    });
-    worker_->start();
-  }
-  void stopCapture() {
-    finishRecording();
-    if (!worker_) return;
-    worker_->requestInterruption();
-    worker_->wait();
-    delete worker_; worker_ = nullptr;
-    for (auto* meter : meters_) meter->setValue(0);
-  }
-  void startRecording(bool beam) {
-    if (!worker_ || !worker_->isRunning()) { status_->setText("Start audio capture first"); return; }
-    finishRecording();
-    const QString suggested = QStandardPaths::writableLocation(QStandardPaths::MusicLocation) +
-        (beam ? "/Kinect-beam-" : "/Kinect-audio-") +
-        QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss") + ".wav";
-    const QString path = QFileDialog::getSaveFileName(this, beam ? "Record beamformed audio" :
-                                                     "Record four-channel audio", suggested,
-                                                     "WAV audio (*.wav)");
-    if (path.isEmpty()) return;
-    recording_ = std::make_unique<QSaveFile>(path);
-    beamMode_ = beam;
-    if (!recording_->open(QIODevice::WriteOnly)) {
-      status_->setText(recording_->errorString()); recording_.reset(); return;
-    }
-    QByteArray header(44, 0);
-    auto put16 = [&](int offset, quint16 value) { std::memcpy(header.data() + offset, &value, 2); };
-    auto put32 = [&](int offset, quint32 value) { std::memcpy(header.data() + offset, &value, 4); };
-    std::memcpy(header.data(), "RIFF", 4); std::memcpy(header.data() + 8, "WAVEfmt ", 8);
-    put32(16, 16); put16(20, 1); put16(22, beam ? 1 : 4); put32(24, 16000);
-    put32(28, beam ? 32000 : 256000); put16(32, beam ? 2 : 16);
-    put16(34, beam ? 16 : 32);
-    std::memcpy(header.data() + 36, "data", 4);
-    if (recording_->write(header) != header.size()) {
-      status_->setText(recording_->errorString()); recording_.reset(); return;
-    }
-    status_->setText(beam ? "Recording beamformed WAV" : "Recording four-channel WAV");
-  }
-  void finishRecording() {
-    if (!recording_) return;
-    const qint64 bytes = recording_->size() - 44;
-    if (bytes < 0 || bytes > 0xffffffffu - 36u || !recording_->seek(4)) {
-      status_->setText("WAV recording exceeded the format limit");
-      recording_.reset(); return;
-    }
-    const quint32 riff = quint32(bytes + 36), data = quint32(bytes);
-    if (recording_->write(reinterpret_cast<const char*>(&riff), 4) != 4 ||
-        !recording_->seek(40) ||
-        recording_->write(reinterpret_cast<const char*>(&data), 4) != 4 ||
-        !recording_->commit()) status_->setText("Could not finalize WAV recording");
-    else status_->setText(QString("Saved %1 bytes of four-channel audio").arg(bytes));
-    recording_.reset();
-  }
-  std::vector<Device> found_;
-  AudioWorker* worker_ = nullptr;
-  std::unique_ptr<QSaveFile> recording_;
-  QComboBox* devices_ = nullptr;
-  QProgressBar* meters_[4]{};
-  QSlider* volume_ = nullptr;
-  QCheckBox* mute_ = nullptr;
-  QLabel* status_ = nullptr;
-  QLabel* direction_ = nullptr;
-  bool beamMode_ = false;
-  quint64 frames_ = 0;
-};
-
-class AcousticView : public QWidget {
- public:
-  explicit AcousticView(QWidget* parent = nullptr) : QWidget(parent) {
-    setMinimumSize(600, 360);
-    occupancy_.fill(0);
-  }
-  void updateScan(float azimuth, float confidence, float rms) {
-    for (float& value : occupancy_) value *= 0.94f;
-    if (rms >= 0.0018f && confidence >= 0.015f) {
-      direction_ = std::clamp(azimuth, -90.0f, 90.0f);
-      confidence_ = confidence;
-      const int center = std::clamp(int(std::lround(direction_)) + 90, 0, 180);
-      for (int delta = -8; delta <= 8; ++delta) {
-        const int bin = center + delta;
-        if (bin < 0 || bin >= int(occupancy_.size())) continue;
-        const float contribution = confidence * std::exp(-0.5f * delta * delta / 12.0f);
-        occupancy_[size_t(bin)] = std::clamp(occupancy_[size_t(bin)] + contribution * 0.16f, 0.0f, 1.0f);
-      }
-    }
-    update();
-  }
- protected:
-  void paintEvent(QPaintEvent*) override {
-    QPainter painter(this);
-    painter.setRenderHint(QPainter::Antialiasing);
-    painter.fillRect(rect(), QColor(19, 26, 34));
-    const QPointF origin(width() / 2.0, height() - 34.0);
-    const float radius = std::min(width() * 0.43f, height() - 64.0f);
-    painter.setPen(QPen(QColor(80, 95, 110), 1));
-    for (float fraction : {0.25f, 0.5f, 0.75f, 1.0f}) {
-      const QRectF circle(origin.x() - radius * fraction, origin.y() - radius * fraction,
-                          radius * fraction * 2, radius * fraction * 2);
-      painter.drawArc(circle, 0, 180 * 16);
-    }
-    for (int degree = -90; degree <= 90; degree += 30) {
-      const float radians = degree * 3.14159265358979323846f / 180;
-      const QPointF end(origin.x() + std::sin(radians) * radius,
-                        origin.y() - std::cos(radians) * radius);
-      painter.drawLine(origin, end);
-      painter.drawText(end + QPointF(-12, -6), QString::number(degree) + "°");
-    }
-    for (int bin = 0; bin < 181; ++bin) {
-      const float radians = (bin - 90) * 3.14159265358979323846f / 180;
-      const float occupancy = occupancy_[size_t(bin)];
-      if (occupancy < 0.015f) continue;
-      painter.setPen(QPen(QColor(30 + int(occupancy * 220), 155 + int(occupancy * 90), 190), 2));
-      painter.drawLine(QPointF(origin.x() + std::sin(radians) * radius * 0.42f,
-                               origin.y() - std::cos(radians) * radius * 0.42f),
-                       QPointF(origin.x() + std::sin(radians) * radius * (0.42f + occupancy * 0.55f),
-                               origin.y() - std::cos(radians) * radius * (0.42f + occupancy * 0.55f)));
-    }
-    const float radians = direction_ * 3.14159265358979323846f / 180;
-    painter.setPen(QPen(QColor(48, 239, 177), 3));
-    painter.drawLine(origin, QPointF(origin.x() + std::sin(radians) * radius * 0.9f,
-                                     origin.y() - std::cos(radians) * radius * 0.9f));
-    painter.setPen(Qt::white);
-    painter.drawText(16, 24, QString("Azimuth %1° · confidence %2%")
-        .arg(direction_, 0, 'f', 1).arg(int(confidence_ * 100)));
-  }
- private:
-  std::array<float, 181> occupancy_{};
-  float direction_ = 0, confidence_ = 0;
-};
-
-class AcousticWindow : public QMainWindow {
- public:
-  AcousticWindow() {
-    setWindowTitle("Kinect Remold — Acoustic Scanner");
-    resize(760, 500);
-    auto* central = new QWidget(this);
-    auto* layout = new QVBoxLayout(central);
-    auto* controls = new QHBoxLayout;
-    devices_ = new QComboBox;
-    auto* refreshButton = new QPushButton("Refresh");
-    auto* start = new QPushButton("Start scan");
-    auto* stop = new QPushButton("Stop");
-    controls->addWidget(devices_, 1); controls->addWidget(refreshButton);
-    controls->addWidget(start); controls->addWidget(stop);
-    layout->addLayout(controls);
-    view_ = new AcousticView;
-    layout->addWidget(view_, 1);
-    status_ = new QLabel;
-    layout->addWidget(status_);
-    setCentralWidget(central);
-    connect(refreshButton, &QPushButton::clicked, this, [this] { refresh(); });
-    connect(start, &QPushButton::clicked, this, [this] { startScan(); });
-    connect(stop, &QPushButton::clicked, this, [this] { stopScan(); });
-    refresh();
-  }
-  ~AcousticWindow() override { stopScan(); }
-  int checkLiveScan() {
-    if (found_.empty()) return 2;
-    startScan();
-    QElapsedTimer timeout; timeout.start();
-    while (timeout.elapsed() < 5000 && frames_ == 0) {
-      QApplication::processEvents(); QThread::msleep(20);
-    }
-    return frames_ > 0 && !view_->grab().isNull() ? 0 : 3;
-  }
- private:
-  void refresh() {
-    if (worker_) return;
-    const QString selected = devices_->currentData().toString();
-    found_ = discoverAt(sdkPath(false));
-    auto one = discoverAt(sdkPath(true)); found_.insert(found_.end(), one.begin(), one.end());
-    found_.erase(std::remove_if(found_.begin(), found_.end(), [](const Device& device) {
-      return device.audio.isEmpty() || device.state != QStringLiteral("Ready");
-    }), found_.end());
-    devices_->clear();
-    for (const Device& device : found_) devices_->addItem(device.label, device.id);
-    const int index = devices_->findData(selected);
-    if (index >= 0) devices_->setCurrentIndex(index);
-    status_->setText(found_.empty() ? "No microphone array endpoint available" :
-                                   QString("%1 microphone array(s) found").arg(found_.size()));
-  }
-  void startScan() {
-    stopScan();
-    const int index = devices_->currentIndex();
-    if (index < 0 || index >= int(found_.size())) return;
-    worker_ = new AudioWorker(found_[size_t(index)], this);
-    connect(worker_, &AudioWorker::message, status_, &QLabel::setText);
-    connect(worker_, &AudioWorker::audioReady, this,
-            [this](const QByteArray&, const QByteArray&, const QVector<int>&,
-                   float azimuth, float confidence, float rms) {
-      ++frames_;
-      view_->updateScan(azimuth, confidence, rms);
-    });
-    worker_->start();
-  }
-  void stopScan() {
-    if (!worker_) return;
-    worker_->requestInterruption(); worker_->wait();
-    delete worker_; worker_ = nullptr;
-  }
-  std::vector<Device> found_;
-  AudioWorker* worker_ = nullptr;
-  QComboBox* devices_ = nullptr;
-  AcousticView* view_ = nullptr;
-  QLabel* status_ = nullptr;
-  quint64 frames_ = 0;
 };
 
 QString calibrationPath(const QString& deviceId) {
@@ -1564,8 +1167,10 @@ class SurveillanceWindow : public QMainWindow {
 class ScannerFusionWorker : public QThread {
   Q_OBJECT
  public:
-  explicit ScannerFusionWorker(QString deviceId, bool turntable, QObject* parent = nullptr)
+  explicit ScannerFusionWorker(QString deviceId, bool turntable, bool headTurn=false,
+                               QObject* parent = nullptr)
       : QThread(parent), deviceId_(std::move(deviceId)), turntable_(turntable),
+        headTurn_(headTurn),
         volume_(192,.008f,.032f) {}
   void submit(QByteArray depth, DepthIntrinsics camera,QImage color={}) {
     QMutexLocker lock(&mutex_);
@@ -1579,6 +1184,7 @@ class ScannerFusionWorker : public QThread {
   const TsdfVolume& volume() const { return volume_; } // Read after stop().
  signals:
   void progress(int frames, int voxels, float sweepDegrees);
+  void meshReady(std::vector<ScannerTriangle> triangles);
   void failed(QString reason);
  protected:
   void run() override {
@@ -1586,8 +1192,12 @@ class ScannerFusionWorker : public QThread {
     bool calibrationChecked = false, centered = false;
     float targetDistanceM = 0;
     QByteArray referenceDepth;
+    QImage referenceColor;
     ScannerPose worldPose;
     ScannerIcp tracker;
+    ScannerVisualTracker visualTracker;
+    ScannerPose lastFusedPose;
+    bool hasFusedPose=false;
     float previousYaw=0,sweepDegrees=0;
     ScannerSupportPlane support;
     bool supportChecked=false;
@@ -1615,21 +1225,53 @@ class ScannerFusionWorker : public QThread {
             if (mm>350 && mm<4000) samples.push_back(mm);
           }
         if (samples.size()<20) { emit failed("Point the sensor at a subject 0.35–4 m away"); continue; }
-        std::nth_element(samples.begin(),samples.begin()+samples.size()/2,samples.end());
-        targetDistanceM=samples[samples.size()/2]*.001f;
+        std::array<int,80> histogram{};
+        for(quint16 mm:samples)++histogram[size_t(std::min(79,int(mm-350)/50))];
+        int targetBin=-1;
+        for(int bin=0;bin<80;++bin) {
+          const int count=histogram[size_t(bin)]+(bin?histogram[size_t(bin-1)]:0)+
+              (bin+1<80?histogram[size_t(bin+1)]:0);
+          if(count>=std::max(12,int(samples.size()/20))) {targetBin=bin;break;}
+        }
+        if(targetBin<0) {emit failed("Center the object and keep hands out of view");continue;}
+        targetDistanceM=(375+targetBin*50)*.001f;
+        if(headTurn_&&targetDistanceM<.65f) {
+          emit failed("Move back: head scanning needs at least 0.65 m of depth range");
+          continue;
+        }
         volume_.reset({0,0,targetDistanceM}); centered = true;
       }
-      if(turntable_) {
+      const QByteArray rawDepth=depth;
+      auto cropForeground=[&](const ScannerPose& pose) {
+        depth=rawDepth;
         for(int y=0;y<camera.height;++y) for(int x=0;x<camera.width;++x) {
           const int offset=(y*camera.width+x)*2;
           const quint16 mm=u16(depth.constData()+offset);
-          if(x<camera.width/10||x>=camera.width*9/10||
-             y<camera.height/10||y>=camera.height*9/10||
-             mm<std::max(350.0f,(targetDistanceM-.5f)*1000)||
-             mm>(targetDistanceM+.5f)*1000) {
-            depth[offset]=0;depth[offset+1]=0;
+          bool keep=mm>=350&&mm<=4000&&x>=camera.width/10&&
+              x<camera.width*9/10&&y>=camera.height/10&&y<camera.height*9/10;
+          if(keep) {
+            if(headTurn_) {
+              double rx=0,ry=0;
+              keep=camera.ray(x,y,rx,ry)&&
+                  std::abs(float(rx)*mm*.001f)<.19f&&
+                  std::abs(float(ry)*mm*.001f)<.17f&&
+                  std::abs(mm*.001f-targetDistanceM)<.22f;
+            } else if(turntable_) keep=mm>=(targetDistanceM-.5f)*1000&&
+                                        mm<=(targetDistanceM+.5f)*1000;
+            else {
+              double rx=0,ry=0;
+              keep=camera.ray(x,y,rx,ry)&&
+                  std::abs(pose.world({float(rx)*mm*.001f,float(ry)*mm*.001f,
+                                       mm*.001f}).z()-targetDistanceM)<=.5f;
+            }
           }
+          if(!keep) {depth[offset]=0;depth[offset+1]=0;}
         }
+      };
+      // Use the last pose for registration, then recrop at the newly estimated pose.
+      // The foreground band stays in world space as the camera moves toward or away.
+      cropForeground(worldPose);
+      if(turntable_&&!headTurn_) {
         if(!supportChecked) {
           support=ScannerSegmentation::findSupport(depth,camera,&calibration);
           supportChecked=true;
@@ -1638,15 +1280,69 @@ class ScannerFusionWorker : public QThread {
       }
       ScannerPose candidatePose=worldPose;
       if (!referenceDepth.isEmpty()) {
+        QElapsedTimer trackingTimer;trackingTimer.start();
+        const ScannerVisualResult visual=(turntable_&&!headTurn_)?ScannerVisualResult{}:
+            visualTracker.align(depth,referenceDepth,camera,color,referenceColor);
+        const qint64 visualMs=trackingTimer.elapsed();
+        const bool strongVisual=visual.accepted&&visual.inliers>=12&&visual.rmsM<.02f;
+        const ScannerPose* initial=strongVisual?&visual.currentToReference:nullptr;
         const ScannerIcpResult tracking=tracker.align(depth,referenceDepth,camera,&calibration,
-                                                      turntable_);
-        if (!tracking.accepted) {
-          emit failed(QString("Tracking lost: %1 matches, %2 mm RMS; frame skipped")
-              .arg(tracking.matches).arg(tracking.rmsM*1000,0,'f',1));
+                                                      turntable_,initial);
+        const bool depthReliable=tracking.accepted&&
+            (turntable_||tracking.translationObservability>=.02f);
+        if (!depthReliable&&!strongVisual) {
+          emit failed(QString("Tracking lost: depth %1 matches / %2 mm RMS / %3 geometry, RGB %4 inliers; frame skipped")
+              .arg(tracking.matches).arg(tracking.rmsM*1000,0,'f',1)
+              .arg(tracking.translationObservability,0,'f',2).arg(visual.inliers));
           continue;
         }
-        candidatePose=worldPose.compose(tracking.currentToReference);
+        ScannerPose relative=depthReliable?tracking.currentToReference:visual.currentToReference;
+        if(strongVisual&&depthReliable) {
+          const QVector3D depthShift(relative.m[3],relative.m[7],relative.m[11]);
+          const QVector3D visualShift(visual.currentToReference.m[3],
+              visual.currentToReference.m[7],visual.currentToReference.m[11]);
+          const QVector3D depthForward(relative.m[2],relative.m[6],relative.m[10]);
+          const QVector3D visualForward(visual.currentToReference.m[2],
+              visual.currentToReference.m[6],visual.currentToReference.m[10]);
+          if((depthShift-visualShift).length()>.04f||
+             (depthForward-visualForward).length()>.08f)
+            relative=visual.currentToReference;
+        }
+        candidatePose=worldPose.compose(relative);
+        if(!qEnvironmentVariableIsEmpty("REMOLD_SCANNER_PROFILE"))
+          qInfo("Scanner tracking: depth %d/%d %.1f mm, observability %.3f, RGB %d/%d %.1f mm; RGB %lld ms, total %lld ms",
+              int(tracking.accepted),tracking.matches,tracking.rmsM*1000,
+              tracking.translationObservability,visual.inliers,visual.matches,visual.rmsM*1000,
+              static_cast<long long>(visualMs),static_cast<long long>(trackingTimer.elapsed()));
       }
+      if(headTurn_) {
+        // A head turns around a neck close to the initial head position. Sequential
+        // ICP can otherwise accumulate millimetres of lateral error per frame.
+        const QVector3D anchor(0,0,targetDistanceM+.09f);
+        QVector3D drift=candidatePose.world(anchor)-anchor;
+        constexpr float allowedDrift=.035f;
+        if(drift.length()>allowedDrift) {
+          drift-=drift.normalized()*allowedDrift;
+          candidatePose.m[3]-=drift.x();
+          candidatePose.m[7]-=drift.y();
+          candidatePose.m[11]-=drift.z();
+        }
+        if(hasFusedPose) {
+          const QVector3D lastForward(lastFusedPose.m[2],lastFusedPose.m[6],lastFusedPose.m[10]);
+          const QVector3D nextForward(candidatePose.m[2],candidatePose.m[6],candidatePose.m[10]);
+          const QVector3D lastRight(lastFusedPose.m[0],lastFusedPose.m[4],lastFusedPose.m[8]);
+          const QVector3D nextRight(candidatePose.m[0],candidatePose.m[4],candidatePose.m[8]);
+          const float motion=std::max((lastForward-nextForward).length(),
+                                      (lastRight-nextRight).length());
+          if(motion<.014f&&
+             (lastFusedPose.world(anchor)-candidatePose.world(anchor)).length()<.004f) {
+            worldPose=candidatePose;
+            referenceDepth=std::move(depth);referenceColor=std::move(color);
+            continue;
+          }
+        }
+      }
+      if(!turntable_) cropForeground(candidatePose);
       if (volume_.observedVoxels()>0) {
         QVector3D low(100,100,100),high(-100,-100,-100);
         int bounds=0;
@@ -1655,10 +1351,11 @@ class ScannerFusionWorker : public QThread {
             quint16 mm=u16(depth.constData()+(y*camera.width+x)*2);
             mm=calibration.correct(x,y,mm);
             const float z=mm*.001f;
-            if(z<targetDistanceM-.5f||z>targetDistanceM+.5f) continue;
+            if(z<.35f||z>4.f) continue;
             double rx=0,ry=0;
             if(!camera.ray(x,y,rx,ry)) continue;
             const QVector3D p=candidatePose.world({float(rx)*z,float(ry)*z,z});
+            if(std::abs(p.z()-targetDistanceM)>.5f) continue;
             low.setX(std::min(low.x(),p.x()));low.setY(std::min(low.y(),p.y()));
             low.setZ(std::min(low.z(),p.z()));
             high.setX(std::max(high.x(),p.x()));high.setY(std::max(high.y(),p.y()));
@@ -1673,14 +1370,19 @@ class ScannerFusionWorker : public QThread {
           sweepDegrees+=std::abs(std::remainder(yaw-previousYaw,6.28318530718f))*57.2957795f;
           previousYaw=yaw;
         }
-        worldPose=candidatePose; referenceDepth=std::move(depth);
+        worldPose=candidatePose;
+        lastFusedPose=candidatePose;hasFusedPose=true;
+        referenceDepth=std::move(depth);referenceColor=std::move(color);
         emit progress(volume_.integratedFrames(),volume_.observedVoxels(),sweepDegrees);
+        if(volume_.integratedFrames()==2||volume_.integratedFrames()%8==0)
+          emit meshReady(volume_.mesh(2));
       }
     }
   }
  private:
   QString deviceId_;
   bool turntable_ = false;
+  bool headTurn_ = false;
   QMutex mutex_;
   QWaitCondition ready_;
   QByteArray pendingDepth_;
@@ -1696,50 +1398,69 @@ class ScannerMeshPreview : public QWidget {
     setMinimumSize(360,320);
   }
   void setMesh(const std::vector<ScannerTriangle>& triangles) {
-    points_.clear();
+    triangles_.clear();
     if(triangles.empty()) {update();return;}
-    const size_t stride=std::max<size_t>(1,triangles.size()/9000);
+    const size_t stride=std::max<size_t>(1,(triangles.size()+19999)/20000);
     QVector3D low(100,100,100),high(-100,-100,-100);
     for(size_t i=0;i<triangles.size();i+=stride) {
-      const QVector3D p=(triangles[i].a+triangles[i].b+triangles[i].c)/3;
-      const QRgb rgb=triangles[i].ca;
-      points_.push_back({p,qRed(rgb)==180&&qGreen(rgb)==180&&qBlue(rgb)==180
-                           ?QColor(85,221,179):QColor(rgb)});
-      low.setX(std::min(low.x(),p.x()));low.setY(std::min(low.y(),p.y()));
-      low.setZ(std::min(low.z(),p.z()));
-      high.setX(std::max(high.x(),p.x()));high.setY(std::max(high.y(),p.y()));
-      high.setZ(std::max(high.z(),p.z()));
+      const auto& triangle=triangles[i];
+      triangles_.push_back(triangle);
+      for(const QVector3D& p:{triangle.a,triangle.b,triangle.c}) {
+        low.setX(std::min(low.x(),p.x()));low.setY(std::min(low.y(),p.y()));
+        low.setZ(std::min(low.z(),p.z()));
+        high.setX(std::max(high.x(),p.x()));high.setY(std::max(high.y(),p.y()));
+        high.setZ(std::max(high.z(),p.z()));
+      }
     }
     center_=(low+high)*.5f;
     span_=std::max({high.x()-low.x(),high.y()-low.y(),high.z()-low.z(),.1f});
     update();
   }
+  bool hasMesh() const {return !triangles_.empty();}
  protected:
   void paintEvent(QPaintEvent*) override {
     QPainter painter(this);painter.fillRect(rect(),QColor(15,21,28));
-    painter.setRenderHint(QPainter::Antialiasing,false);
-    if(points_.empty()) {
+    painter.setRenderHint(QPainter::Antialiasing,true);
+    if(triangles_.empty()) {
       painter.setPen(QColor(220,228,237));
-      painter.drawText(rect(),Qt::AlignCenter,"Stop capture to inspect the fused mesh.");
+      painter.drawText(rect(),Qt::AlignCenter,"Capture a few views to build the mesh preview.");
       return;
     }
     const float cy=std::cos(yaw_),sy=std::sin(yaw_);
     const float cp=std::cos(pitch_),sp=std::sin(pitch_);
     const float scale=std::min(width(),height())*.78f/span_;
-    for(const auto& sample:points_) {
-      painter.setPen(sample.color);
-      const QVector3D p=sample.point-center_;
+    auto project=[&](const QVector3D& point) {
+      const QVector3D p=point-center_;
       const float x=cy*p.x()+sy*p.z();
       const float z=-sy*p.x()+cy*p.z();
       const float y=cp*p.y()-sp*z;
       const float depth=sp*p.y()+cp*z;
       const float perspective=1.0f/(1.0f+depth/(span_*2.5f));
-      const int sx=int(width()*.5f+x*scale*perspective);
-      const int sy=int(height()*.5f+y*scale*perspective);
-      if(sx>=0&&sy>=0&&sx<width()&&sy<height()) painter.drawPoint(sx,sy);
+      return std::pair<QPointF,float>{{width()*.5f+x*scale*perspective,
+          height()*.5f+y*scale*perspective},depth};
+    };
+    struct Drawn {QPolygonF polygon;QColor color;float depth;};
+    std::vector<Drawn> drawn;drawn.reserve(triangles_.size());
+    for(const auto& triangle:triangles_) {
+      const auto a=project(triangle.a),b=project(triangle.b),c=project(triangle.c);
+      const QRgb colors[]{triangle.ca,triangle.cb,triangle.cc};
+      const bool uncolored=std::all_of(std::begin(colors),std::end(colors),[](QRgb rgb){
+        return qRed(rgb)==180&&qGreen(rgb)==180&&qBlue(rgb)==180;
+      });
+      QColor color=uncolored?QColor(85,221,179):QColor(
+          (qRed(colors[0])+qRed(colors[1])+qRed(colors[2]))/3,
+          (qGreen(colors[0])+qGreen(colors[1])+qGreen(colors[2]))/3,
+          (qBlue(colors[0])+qBlue(colors[1])+qBlue(colors[2]))/3);
+      drawn.push_back({QPolygonF{a.first,b.first,c.first},color,
+          (a.second+b.second+c.second)/3});
     }
+    std::sort(drawn.begin(),drawn.end(),[](const Drawn& a,const Drawn& b){
+      return a.depth>b.depth;
+    });
+    painter.setPen(Qt::NoPen);
+    for(const auto& triangle:drawn) {painter.setBrush(triangle.color);painter.drawPolygon(triangle.polygon);}
     painter.setPen(QColor(210,220,230));
-    painter.drawText(12,22,QString("%1 surface samples · drag to orbit").arg(points_.size()));
+    painter.drawText(12,22,QString("%1 preview triangles · drag to orbit").arg(triangles_.size()));
   }
   void mousePressEvent(QMouseEvent* event) override { lastMouse_=event->pos(); }
   void mouseMoveEvent(QMouseEvent* event) override {
@@ -1750,8 +1471,7 @@ class ScannerMeshPreview : public QWidget {
     update();
   }
  private:
-  struct PreviewPoint {QVector3D point;QColor color;};
-  std::vector<PreviewPoint> points_;
+  std::vector<ScannerTriangle> triangles_;
   QVector3D center_;
   float span_=1,yaw_=0.25f,pitch_=-.2f;
   QPoint lastMouse_;
@@ -1760,18 +1480,31 @@ class ScannerMeshPreview : public QWidget {
 class ScannerWindow : public QMainWindow {
  public:
   ScannerWindow() {
+    qRegisterMetaType<std::vector<ScannerTriangle>>();
     setWindowTitle("Kinect Remold — 3D Scanner"); resize(900,700);
     auto* central=new QWidget(this); auto* layout=new QVBoxLayout(central);
     auto* controls=new QHBoxLayout;
     devices_=new QComboBox;
-    mode_=new QComboBox;mode_->addItems({"Moving Kinect", "Turntable"});
+    mode_=new QComboBox;mode_->addItems({"Move Kinect · object stays still", "Rotate object · camera stays still",
+                                       "Turn head · camera stays still"});
     auto* refreshButton=new QPushButton("Refresh");
     auto* startButton=new QPushButton("Start TSDF capture");
     auto* stopButton=new QPushButton("Stop");
-    auto* exportButton=new QPushButton("Export mesh");
+    auto* exportButton=new QPushButton("Export colored mesh");
     controls->addWidget(devices_,1); controls->addWidget(mode_); controls->addWidget(refreshButton);
     controls->addWidget(startButton); controls->addWidget(stopButton);
     controls->addWidget(exportButton); layout->addLayout(controls);
+    auto* instructions=new QLabel;
+    instructions->setWordWrap(true);
+    layout->addWidget(instructions);
+    auto explain=[this,instructions](int mode){
+      instructions->setText(mode==2?
+          "Center your head in the depth view at least 0.65 m from the sensor, then turn slowly while keeping your shoulders still. The scanner keeps a small region around the head to exclude most of the torso and background. Hair, ears, and the back of the head need visible depth views; stop and inspect before export.":mode==1?
+          "Place the object on a stable turntable or support, keep the Kinect still, and rotate the object slowly. Move hands out of view between steps. The scanner attempts to mask the support plane and distant background. Stop when you have covered the object, then export a vertex-colored PLY or OBJ mesh.":
+          "Keep the object stationary and move the Kinect slowly around it. Translation, pitch, roll, and yaw are tracked from RGB and depth; keep the object visible and move gradually between frames. Clear the background and keep hands out of view. Stop after several viewpoints, then export a vertex-colored PLY or OBJ mesh.");
+    };
+    connect(mode_,QOverload<int>::of(&QComboBox::currentIndexChanged),this,explain);
+    explain(mode_->currentIndex());
     auto* views=new QHBoxLayout;
     preview_=new QLabel("Select a metric depth sensor to begin a TSDF capture.");
     preview_->setMinimumSize(360,320); preview_->setAlignment(Qt::AlignCenter);
@@ -1797,6 +1530,7 @@ class ScannerWindow : public QMainWindow {
       QThread::msleep(20);
     }
     stop();
+    QApplication::processEvents();
     if(lastFrames_<targetFrames || !fusion_) return 3;
     const auto triangles=fusion_->volume().mesh(2);
     const int colored=int(std::count_if(triangles.begin(),triangles.end(),[](const ScannerTriangle& t){
@@ -1804,7 +1538,8 @@ class ScannerWindow : public QMainWindow {
     }));
     fprintf(stderr,"TSDF: %d frames, %d rejected, %d voxels, %zu triangles, %d colored\n",lastFrames_,
             rejectedFrames_,fusion_->volume().observedVoxels(),triangles.size(),colored);
-    return triangles.size()>100&&(targetFrames<10||colored>100)?0:4;
+    return triangles.size()>100&&meshPreview_->hasMesh()&&
+        (targetFrames<10||colored>100)?0:4;
   }
  private:
   void refresh() {
@@ -1821,13 +1556,17 @@ class ScannerWindow : public QMainWindow {
   }
   void start() {
     stop();
+    ++pairGeneration_;rgbSamples_.clear();pendingDepth_.clear();pairScheduled_=false;
     delete fusion_; fusion_=nullptr;
     lastFrames_=rejectedFrames_=0;
     const int index=devices_->currentIndex();
     if(index<0 || index>=int(found_.size())) return;
     const Device d=found_[size_t(index)];
-    const bool turntable=mode_->currentIndex()==1;
-    fusion_=new ScannerFusionWorker(d.id,turntable,this);
+    const bool turntable=mode_->currentIndex()!=0;
+    const bool headTurn=mode_->currentIndex()==2;
+    expectsColor_=d.generation=="xbox-one";
+    scanStartTimer_.start();
+    fusion_=new ScannerFusionWorker(d.id,turntable,headTurn,this);
     connect(fusion_,&ScannerFusionWorker::progress,this,[this,turntable](int frames,int voxels,float sweep){
       lastFrames_=frames;
       status_->setText(turntable?QString("TSDF: %1 frames, %2 voxels, %3° sweep")
@@ -1838,8 +1577,11 @@ class ScannerWindow : public QMainWindow {
       if(reason.startsWith("Tracking lost")) ++rejectedFrames_;
       status_->setText(reason);
     });
+    connect(fusion_,&ScannerFusionWorker::meshReady,this,[this](const std::vector<ScannerTriangle>& triangles){
+      meshPreview_->setMesh(triangles);
+    });
     fusion_->start();
-    const bool colorCapture=d.generation=="xbox-one";
+    const bool colorCapture=expectsColor_;
     stream_=new StreamWorker(d,colorCapture?5u:4u,0,this);
     auto showPreview=[this](const QImage& image){
       preview_->setPixmap(QPixmap::fromImage(image).scaled(preview_->size(),Qt::KeepAspectRatio,
@@ -1847,22 +1589,49 @@ class ScannerWindow : public QMainWindow {
     };
     if(colorCapture)connect(stream_,&StreamWorker::rgbReady,this,
         [this,showPreview](const QImage& image,quint64 tick){
-          latestRgb_=image;latestRgbTick_=tick;latestRgbTime_.restart();showPreview(image);
+          rgbSamples_.push_back({tick,image});
+          while(rgbSamples_.size()>6)rgbSamples_.pop_front();
+          showPreview(image);
         });
     else connect(stream_,&StreamWorker::frameReady,this,showPreview);
-    connect(stream_,&StreamWorker::depthStamp,this,[this](quint64 tick){latestDepthTick_=tick;});
+    connect(stream_,&StreamWorker::depthStamp,this,[this](quint64 tick){pendingDepthTick_=tick;});
     connect(stream_,&StreamWorker::depthReady,this,
             [this](const QByteArray& depth,int w,int h,double fx,double fy,double cx,double cy,
                    const QByteArray& extension) {
-      const quint64 skew=latestRgbTick_>latestDepthTick_?
-          latestRgbTick_-latestDepthTick_:latestDepthTick_-latestRgbTick_;
-      if(fusion_)fusion_->submit(depth,{w,h,fx,fy,cx,cy,extension},
-          latestRgbTime_.isValid()&&latestRgbTime_.elapsed()<150&&skew<=100?latestRgb_:QImage{});
+      pendingDepth_=depth;pendingCamera_={w,h,fx,fy,cx,cy,extension};
+      if(pairScheduled_)return;
+      pairScheduled_=true;
+      const quint64 generation=pairGeneration_;
+      QTimer::singleShot(40,this,[this,generation]{
+        if(generation!=pairGeneration_)return;
+        pairScheduled_=false;
+        if(!fusion_||!fusion_->isRunning()||pendingDepth_.isEmpty())return;
+        if(expectsColor_&&rgbSamples_.empty()&&scanStartTimer_.elapsed()<2000)return;
+        QImage matched;
+        quint64 bestSkew=std::numeric_limits<quint64>::max();
+        for(const auto& sample:rgbSamples_) {
+          const quint64 skew=sample.first>pendingDepthTick_?
+              sample.first-pendingDepthTick_:pendingDepthTick_-sample.first;
+          if(skew<bestSkew) {bestSkew=skew;matched=sample.second;}
+        }
+        if(!qEnvironmentVariableIsEmpty("REMOLD_SCANNER_PROFILE"))
+          qInfo("Scanner RGB-D pair: depth %llu, nearest skew %llu ms, RGB samples %zu",
+              static_cast<unsigned long long>(pendingDepthTick_),
+              static_cast<unsigned long long>(bestSkew),rgbSamples_.size());
+        if(expectsColor_&&bestSkew>40) {
+          pendingDepth_.clear();
+          status_->setText("Waiting for a synchronized RGB + depth pair (within 40 ms)");
+          return;
+        }
+        fusion_->submit(std::move(pendingDepth_),pendingCamera_,matched);
+        pendingDepth_.clear();
+      });
     });
     connect(stream_,&StreamWorker::message,status_,&QLabel::setText);
     stream_->startLatest();
   }
   void stop() {
+    ++pairGeneration_;pairScheduled_=false;pendingDepth_.clear();rgbSamples_.clear();
     if(stream_) { stream_->requestInterruption(); stream_->wait(); delete stream_; stream_=nullptr; }
     if(fusion_) fusion_->stop();
   }
@@ -1880,7 +1649,7 @@ class ScannerWindow : public QMainWindow {
     const QString suggested=folder+"/Kinect-scan-"+
         QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss")+".ply";
     const QString path=QFileDialog::getSaveFileName(this,"Export fused mesh",suggested,
-        "PLY mesh (*.ply);;STL mesh (*.stl);;Wavefront OBJ mesh (*.obj)");
+        "Vertex-color PLY mesh (*.ply);;Vertex-color OBJ mesh (*.obj)");
     if(path.isEmpty()) return;
     QString error;
     status_->setText(ScannerMeshWriter::write(path,triangles,error)?
@@ -1893,8 +1662,11 @@ class ScannerWindow : public QMainWindow {
   StreamWorker* stream_=nullptr; ScannerFusionWorker* fusion_=nullptr;
   int lastFrames_=0;
   int rejectedFrames_=0;
-  QImage latestRgb_;QElapsedTimer latestRgbTime_;
-  quint64 latestRgbTick_=0,latestDepthTick_=0;
+  std::deque<std::pair<quint64,QImage>> rgbSamples_;
+  QByteArray pendingDepth_;DepthIntrinsics pendingCamera_;
+  quint64 pendingDepthTick_=0,pairGeneration_=0;
+  bool pairScheduled_=false;
+  bool expectsColor_=false;QElapsedTimer scanStartTimer_;
 };
 
 #ifdef REMOLD_HAS_ONNX
@@ -1943,7 +1715,8 @@ class MocapStageView : public QWidget {
     return {imageRect.x()+uv[0].toDouble()*imageRect.width(),
             imageRect.y()+uv[1].toDouble()*imageRect.height()};
   }
-  template<class Projection> static void drawBones(QPainter& p,const QJsonObject& j,Projection project) {
+  template<class Projection> static void drawBones(QPainter& p,const QJsonObject& j,
+      Projection project,QColor color=QColor(68,225,171)) {
     static const std::pair<const char*,const char*> edges[]{
       {"shoulderL","shoulderR"},
       {"shoulderL","hipL"},{"shoulderR","hipR"},{"hipL","hipR"},
@@ -1951,7 +1724,7 @@ class MocapStageView : public QWidget {
       {"shoulderR","elbowR"},{"elbowR","wristR"},
       {"hipL","kneeL"},{"kneeL","ankleL"},
       {"hipR","kneeR"},{"kneeR","ankleR"}};
-    p.setPen(QPen(QColor(68,225,171),3,Qt::SolidLine,Qt::RoundCap));
+    p.setPen(QPen(color,3,Qt::SolidLine,Qt::RoundCap));
     const QJsonObject head=j.value("head").toObject();
     const QJsonObject leftShoulder=j.value("shoulderL").toObject();
     const QJsonObject rightShoulder=j.value("shoulderR").toObject();
@@ -1967,7 +1740,7 @@ class MocapStageView : public QWidget {
       const QPointF pa=project(a),pb=project(b);
       if(pa.x()>=0&&pb.x()>=0)p.drawLine(pa,pb);
     }
-    p.setPen(QPen(QColor(248,215,95),2));p.setBrush(QColor(248,215,95));
+    p.setPen(QPen(color.lighter(140),2));p.setBrush(color.lighter(140));
     for(auto it=j.begin();it!=j.end();++it) {
       if(it.key().startsWith("hand")&& !it.key().endsWith("_0")&&
          !it.key().endsWith("_4")&&!it.key().endsWith("_8")&&
@@ -1981,6 +1754,8 @@ class MocapStageView : public QWidget {
     if(!faceSurface_)return;
     const QJsonObject face=pose_.value("face").toObject();
     if(!face.value("tracked").toBool())return;
+    const QString faceSensor=face.value("sourceSensor").toString();
+    if(!faceSensor.isEmpty()&&faceSensor!=pose_.value("device").toString())return;
     const bool marginal=face.value("quality").toObject().value("state")=="yellow";
     const QJsonArray points=face.value("landmarks").toArray();
     if(points.size()!=478)return;
@@ -2054,12 +1829,21 @@ class MocapStageView : public QWidget {
       p.drawLine(project({float(i)*.4f,1,1}),project({float(i)*.4f,1,4}));
       p.drawLine(project({-2,1,2+float(i)*.4f}),project({2,1,2+float(i)*.4f}));
     }
-    drawBones(p,joints(pose_),[&](const QJsonObject& joint){
+    const auto draw=[&](const QJsonObject& joint){
       const QJsonArray a=joint.value("p").toArray();
       return a.size()==3?project(position(joint)):QPointF(-1,-1);
-    });
+    };
+    const QJsonArray tracks=pose_.value("tracks").toArray();
+    if(tracks.isEmpty())drawBones(p,joints(pose_),draw);
+    else for(int i=0;i<tracks.size();++i) {
+      const QJsonObject track=tracks[i].toObject();
+      if(track.value("space")!="room")continue;
+      drawBones(p,joints(QJsonObject{{"bodies",track.value("bodies")}}),draw,
+          i==0?QColor(68,225,171):QColor(246,105,192));
+    }
     p.setPen(QColor(230,239,247));
-    p.drawText(area.adjusted(12,10,-10,-10),Qt::AlignTop,"3D STAGE · DRAG TO ORBIT");
+    p.drawText(area.adjusted(12,10,-10,-10),Qt::AlignTop,
+        tracks.isEmpty()?"3D STAGE · DRAG TO ORBIT":"3D STAGE · ALIGNED PEOPLE · DRAG TO ORBIT");
     p.restore();
   }
   QImage frame_;QJsonObject pose_;View view_=View::Split;bool faceSurface_=true;
@@ -2194,9 +1978,18 @@ class MotionCaptureWindow : public QMainWindow {
     auto* startButton=new QPushButton("Start tracking");
     auto* checkButton=new QPushButton("Run fit check");
     auto* stopButton=new QPushButton("Stop");
-    top->addWidget(devices_,1);top->addWidget(refreshButton);
+    captureMode_=new QComboBox;
+    captureMode_->addItems({"One person · one sensor", "One person · combine local sensors",
+                            "Several people · local sensors", "Controller · several remote people",
+                            "Controller · combine remote sensors"});
+    captureMode_->setToolTip("Choose the capture layout before starting. Each sensor has its own body and face tracker.");
+    top->addWidget(devices_,1);top->addWidget(new QLabel("Layout"));
+    top->addWidget(captureMode_);top->addWidget(refreshButton);
     top->addWidget(startButton);top->addWidget(checkButton);top->addWidget(stopButton);
     layout->addLayout(top);
+    modeHelp_=new QLabel;modeHelp_->setWordWrap(true);
+    modeHelp_->setStyleSheet("background:#e8f1f8;color:#17334b;padding:6px;border-radius:4px;");
+    layout->addWidget(modeHelp_);
     auto* sources=new QHBoxLayout;
     bodyEnabled_=new QCheckBox("Body + hands");bodyEnabled_->setChecked(true);
     faceEnabled_=new QCheckBox("Face");faceEnabled_->setChecked(true);
@@ -2212,6 +2005,27 @@ class MotionCaptureWindow : public QMainWindow {
       smoother_.setStability(value);
     });
     sources->addStretch();layout->addLayout(sources);
+    auto* audioRow=new QHBoxLayout;
+    audioRow->addWidget(new QLabel("SENSOR AUDIO"));
+    audioInputs_=new QListWidget;
+    audioInputs_->setMaximumHeight(80);
+    audioInputs_->setToolTip("Checked Kinect microphone inputs are recorded as WAV beside each motion clip.");
+    audioRow->addWidget(audioInputs_,1);
+    auto* refreshAudio=new QPushButton("Refresh audio");
+    audioRow->addWidget(refreshAudio);
+    audioStatus_=new QLabel;
+    audioStatus_->setWordWrap(true);
+    audioRow->addWidget(audioStatus_,1);
+    layout->addLayout(audioRow);
+    connect(refreshAudio,&QPushButton::clicked,this,[this]{refreshAudioInputs();});
+    auto* mediaDevices=new QMediaDevices(this);
+    connect(mediaDevices,&QMediaDevices::audioInputsChanged,this,[this]{refreshAudioInputs();});
+    refreshAudioInputs();
+    connect(audioInputs_,&QListWidget::itemChanged,this,[this]{audioSelectionTouched_=true;});
+    connect(devices_,QOverload<int>::of(&QComboBox::currentIndexChanged),this,
+        [this]{applyDefaultAudioSelection();});
+    connect(captureMode_,QOverload<int>::of(&QComboBox::currentIndexChanged),this,
+        [this]{applyDefaultAudioSelection();});
     auto* performanceRow=new QHBoxLayout;
     performanceRow->addWidget(new QLabel("INFERENCE"));
     bodyProvider_=new QComboBox;handProvider_=new QComboBox;faceProvider_=new QComboBox;
@@ -2324,6 +2138,8 @@ class MotionCaptureWindow : public QMainWindow {
     };
     meter("Jaw",jawMeter_);meter("Smile",smileMeter_);meter("Blink",blinkMeter_);
     faceMonitor->addStretch();layout->addLayout(faceMonitor);
+    peopleStatus_=new QLabel("Person tracks appear here during multi-person capture.");
+    layout->addWidget(peopleStatus_);
     auto* calibrationPanel=new QWidget;
     auto* calibrationRow=new QVBoxLayout(calibrationPanel);
     calibrationList_=new QListWidget;
@@ -2426,7 +2242,31 @@ class MotionCaptureWindow : public QMainWindow {
     workspace->addWidget(stage_,1);
     auto* sensorPanel=new QWidget;
     auto* sidebar=new QVBoxLayout(sensorPanel);
-    sidebar->addWidget(new QLabel("SENSORS"));
+    sidebar->addWidget(new QLabel("ROOM ALIGNMENT · MULTI-PERSON"));
+    auto* alignSensors=new QPushButton("Align from shared pose");
+    alignSensors->setToolTip("Have the same person stand still and visible to all sensors, then align their camera spaces.");
+    connect(alignSensors,&QPushButton::clicked,this,[this]{alignRoomFromPose();});
+    sidebar->addWidget(alignSensors);
+    auto* placeSensors=new QPushButton("Set measured sensor placement…");
+    connect(placeSensors,&QPushButton::clicked,this,[this]{setRoomPlacement();});
+    sidebar->addWidget(placeSensors);
+    connect(captureMode_,QOverload<int>::of(&QComboBox::currentIndexChanged),this,
+        [this,alignSensors,placeSensors](int mode) {
+      const bool multiple=mode==2||mode==3;
+      alignSensors->setVisible(multiple);placeSensors->setVisible(multiple);
+      modeHelp_->setText(mode==0?
+          "1. Select the sensor above. 2. Choose Body + hands, Face, or both. 3. Start tracking. One person is solved from that sensor.":
+          mode==1?
+          "1. Point two or more local sensors at the SAME person. 2. Enable Body + hands, Face, or both. 3. Start tracking. Body joints are combined; facial expressions are combined from confident views, with the mesh from the clearest view. The camera behind that mesh is named in the output.":
+          mode==2?
+          "1. Aim one local sensor at EACH person. 2. Enable Body + hands, Face, or both. 3. Start tracking. 4. In Sensors & LAN, align from a shared pose or measured placement for a common 3D stage. One clip contains a body and face track per person.":
+          mode==3?
+          "CONTROLLER: In Sensors & LAN, enter TLS files and click Listen as controller. On each sensor host, choose a local layout, enter the same trusted CA plus its own identity, Join controller, then Start tracking. Start this controller capture to record synchronized body + face tracks; align rooms for a shared 3D stage.":
+          "CONTROLLER: Listen as controller, join from the sensor hosts, and point their sensors at the SAME person. Start this capture to combine remote body joints and facial expressions into one solve.");
+    });
+    captureMode_->setCurrentIndex(-1);
+    captureMode_->setCurrentIndex(0);
+    sidebar->addWidget(new QLabel("SENSOR OBSERVATIONS"));
     sensors_=new QTableWidget(0,4);
     sensors_->setHorizontalHeaderLabels({"Sensor","Source","Joints","Status"});
     sensors_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -2459,7 +2299,7 @@ class MotionCaptureWindow : public QMainWindow {
     lanActions->addWidget(lanPort_);lanActions->addWidget(hostButton);
     lanActions->addWidget(connectButton);lanActions->addWidget(disconnectButton);
     sidebar->addLayout(lanActions);
-    lanStatus_=new QLabel("Controller listens for authenticated sensor hosts. Each host selects a local Kinect, joins the controller, and starts tracking. Remote observations are preview-only until room calibration and clock sync are configured.");
+    lanStatus_=new QLabel("CONTROLLER: enter TLS files and Listen as controller. SENSOR HOST: select a local capture layout, enter its own TLS identity and the controller URL, Join controller, then Start tracking. Remote body and face observations can be recorded or combined in a controller layout above.");
     lanStatus_->setWordWrap(true);sidebar->addWidget(lanStatus_);
     sideTabs_=new QTabWidget;
     sideTabs_->setMinimumWidth(360);sideTabs_->setMaximumWidth(440);
@@ -2528,27 +2368,87 @@ class MotionCaptureWindow : public QMainWindow {
     });
     connect(&lan_,&LanPoseLink::failed,lanStatus_,&QLabel::setText);
     connect(&lan_,&LanPoseLink::peersChanged,this,[this](int count){
-      lanStatus_->setText(QString("%1 authenticated LAN peer(s) · preview only").arg(count));
+      lanStatus_->setText(QString("%1 authenticated LAN peer(s) · body + face observations")
+          .arg(count));
     });
     connect(&lan_,&LanPoseLink::remotePose,this,[this](const QString& sensor,const QByteArray& pose){
       const QJsonObject root=QJsonDocument::fromJson(pose).object();
       const int count=root.value("bodies").toArray().first().toObject().value("joints").toObject().size();
+      if(!remotePoses_.contains(sensor))remoteSensorOrder_.push_back(sensor);
       remotePoses_[sensor]=pose;
-      updateSensorRow(sensor,"LAN",count,"Preview only");
+      remotePoseTimes_[sensor]=QDateTime::currentMSecsSinceEpoch();
+      updateSensorRow(sensor,"LAN",count,root.value("face").toObject().value("tracked").toBool()?
+          "Body + face":"Body observation");
       if(selectedSensor_==sensor)stage_->setPose(pose);
+    });
+    controllerTimer_.setInterval(33);
+    connect(&controllerTimer_,&QTimer::timeout,this,[this]{
+      if(!processPose_||activeCaptureMode_<3)return;
+      const qint64 now=QDateTime::currentMSecsSinceEpoch();
+      QString primary;
+      for(const QString& sensor:remoteSensorOrder_)
+        if(now-remotePoseTimes_.value(sensor,0)<=250) {primary=sensor;break;}
+      if(primary.isEmpty())return;
+      QJsonObject frame=QJsonDocument::fromJson(remotePoses_.value(primary)).object();
+      frame["t"]=double(now)*.001;
+      frame["frame"]=double(++controllerFrame_);
+      processPose_(QJsonDocument(frame).toJson(QJsonDocument::Compact));
     });
     connect(sensors_,&QTableWidget::cellClicked,this,[this](int row,int){
       selectedSensor_=sensors_->item(row,0)->text();
       if(selectedSensor_=="local") {
         if(!history_.empty())showTimeline(timeline_->value());
       } else {
-        stage_->setFrame({});stage_->setPose(remotePoses_.value(selectedSensor_));
+        stage_->setFrame(localFrames_.value(selectedSensor_));
+        stage_->setPose(localPoses_.contains(selectedSensor_)?
+            localPoses_.value(selectedSensor_):remotePoses_.value(selectedSensor_));
       }
     });
     refresh();
+    refreshAudioInputs();
   }
   ~MotionCaptureWindow() override {stop();lan_.stop();if(editorThread_)editorThread_->wait();
     if(indexThread_)indexThread_->wait();}
+  int checkFaceFusion() const {
+    QJsonArray left{QJsonArray{.2,.3,0.}},right{QJsonArray{.7,.3,0.}};
+    const QJsonObject a{{"tracked",true},{"confidence",.9},{"landmarks",left},
+        {"blendshapes",QJsonObject{{"jawOpen",.2}}}};
+    const QJsonObject b{{"tracked",true},{"confidence",.8},{"landmarks",right},
+        {"blendshapes",QJsonObject{{"jawOpen",.8}}}};
+    const QJsonObject fused=combineFaces({{"sensor-a",a},{"sensor-b",b}});
+    const double jaw=fused.value("blendshapes").toObject().value("jawOpen").toDouble();
+    return fused.value("sources").toArray().size()==2&&
+        fused.value("sourceSensor")=="sensor-a"&&
+        fused.value("landmarks").toArray()==left&&jaw>.4&&jaw<.5?0:2;
+  }
+  int checkAudioWav() {
+    QTemporaryDir directory;
+    if(!directory.isValid())return 2;
+    captureMode_->setCurrentIndex(2);
+    refreshAudioInputs();
+    if(audioInputs_->count()==0)return 3;
+    for(int i=0;i<audioInputs_->count();++i)
+      if(audioInputs_->item(i)->data(Qt::UserRole+1).toString().isEmpty())return 6;
+    const QString clip=directory.filePath("audio-check.rmclip");
+    startCaptureAudio(clip);
+    if(captureAudio_.size()!=size_t(audioInputs_->count()))return 4;
+    QElapsedTimer timer;timer.start();
+    while(timer.elapsed()<5000) {
+      QApplication::processEvents();QThread::msleep(10);
+      if(std::all_of(captureAudio_.begin(),captureAudio_.end(),[](const auto& audio){
+        return audio->bytes>0;
+      }))break;
+    }
+    const int count=int(captureAudio_.size());
+    stopCaptureAudio();
+    for(int i=1;i<=count;++i) {
+      const QString wav=clip+QString(".audio-%1.wav").arg(i);
+      QFile metadata(wav+".json");
+      if(QFileInfo(wav).size()<=44||!metadata.open(QIODevice::ReadOnly)||
+         QJsonDocument::fromJson(metadata.readAll()).object().value("bytes").toDouble()<=0)return 5;
+    }
+    return 0;
+  }
   int checkLive(bool requireFace=false,bool requireFullBody=false,
                 bool bodyOn=true,bool faceOn=true) {
     if(found_.empty()) return 2;
@@ -2721,6 +2621,276 @@ class MotionCaptureWindow : public QMainWindow {
     stop();return frames>=30&&observed>0?0:3;
   }
  private:
+  struct RoomTransform {QQuaternion rotation;QVector3D translation;};
+  static QJsonObject roomTrack(QJsonObject track,const RoomTransform& transform) {
+    QJsonArray bodies=track.value("bodies").toArray();
+    for(int i=0;i<bodies.size();++i) {
+      QJsonObject body=bodies[i].toObject(),joints=body.value("joints").toObject();
+      for(auto it=joints.begin();it!=joints.end();++it) {
+        QJsonObject joint=it.value().toObject();const QJsonArray p=joint.value("p").toArray();
+        if(p.size()!=3)continue;
+        const QVector3D mapped=transform.rotation.rotatedVector(QVector3D(
+            float(p[0].toDouble()),float(p[1].toDouble()),float(p[2].toDouble())))+
+            transform.translation;
+        joint["p"]=QJsonArray{mapped.x(),mapped.y(),mapped.z()};it.value()=joint;
+      }
+      body["joints"]=joints;bodies[i]=body;
+    }
+    track["bodies"]=bodies;
+    QJsonObject face=track.value("face").toObject(),head=face.value("head").toObject();
+    const QJsonArray p=head.value("pCamera").toArray();
+    if(p.size()==3) {
+      const QVector3D mapped=transform.rotation.rotatedVector(QVector3D(
+          float(p[0].toDouble()),float(p[1].toDouble()),float(p[2].toDouble())))+
+          transform.translation;
+      head["pRoom"]=QJsonArray{mapped.x(),mapped.y(),mapped.z()};
+    }
+    const QJsonArray q=head.value("q").toArray();
+    if(q.size()==4) {
+      const QQuaternion measured(q[3].toDouble(),q[0].toDouble(),q[1].toDouble(),q[2].toDouble());
+      const QQuaternion mapped=(transform.rotation*measured).normalized();
+      head["qRoom"]=QJsonArray{mapped.x(),mapped.y(),mapped.z(),mapped.scalar()};
+    }
+    if(!head.isEmpty()) {face["head"]=head;track["face"]=face;}
+    track["space"]="room";return track;
+  }
+  void alignRoomFromPose() {
+    const QJsonObject primary=QJsonDocument::fromJson(latestPrimaryPose_).object();
+    const bool remote=captureMode_->currentIndex()==3;
+    const QJsonArray primaryBodies=primary.value("bodies").toArray();
+    if(primaryBodies.isEmpty()){status_->setText("A shared calibration person must be visible to the selected sensor");return;}
+    if(roomReferenceSensor_!=primary.value("device").toString()) {
+      roomTransforms_.clear();roomReferenceSensor_=primary.value("device").toString();
+    }
+    auto basis=[](const QJsonObject& root,QVector3D& origin,QQuaternion& orientation)->bool {
+      const QJsonArray bodies=root.value("bodies").toArray();if(bodies.isEmpty())return false;
+      const QJsonObject joints=bodies[0].toObject().value("joints").toObject();
+      auto read=[&](const char* key,QVector3D& out) {
+        const QJsonObject joint=joints.value(QLatin1String(key)).toObject();
+        const QJsonArray p=joint.value("p").toArray();
+        if(p.size()!=3||joint.value("c").toDouble()<.4)return false;
+        out={float(p[0].toDouble()),float(p[1].toDouble()),float(p[2].toDouble())};return true;
+      };
+      QVector3D sl,sr,hl,hr;
+      if(!read("shoulderL",sl)||!read("shoulderR",sr)||
+         !read("hipL",hl)||!read("hipR",hr))return false;
+      origin=(sl+sr+hl+hr)*.25f;
+      QVector3D right=sr-sl,up=(sl+sr-hl-hr)*.5f;
+      if(right.length()<.2f||up.length()<.2f)return false;
+      right.normalize();up-=right*QVector3D::dotProduct(up,right);
+      if(up.length()<.15f)return false;up.normalize();
+      const QVector3D forward=QVector3D::crossProduct(right,up).normalized();
+      QMatrix3x3 matrix;
+      for(int row=0;row<3;++row) {
+        matrix(row,0)=right[row];matrix(row,1)=up[row];matrix(row,2)=forward[row];
+      }
+      orientation=QQuaternion::fromRotationMatrix(matrix).normalized();return true;
+    };
+    QVector3D referenceOrigin;QQuaternion referenceRotation;
+    if(!basis(primary,referenceOrigin,referenceRotation)) {
+      status_->setText("Shared pose needs visible shoulders and hips");return;
+    }
+    int aligned=0;
+    QStringList sensors;
+    if(remote)for(const QString& sensor:remoteSensorOrder_)sensors.append(sensor);
+    else for(const Device& device:found_)sensors.append(device.id);
+    for(const QString& sensor:sensors) {
+      if(sensor==primary.value("device").toString())continue;
+      if(QDateTime::currentMSecsSinceEpoch()-(remote?remotePoseTimes_:localPoseTimes_).value(sensor,0)>(remote?250:200))continue;
+      QVector3D sourceOrigin;QQuaternion sourceRotation;
+      if(!basis(QJsonDocument::fromJson((remote?remotePoses_:localPoses_).value(sensor)).object(),
+                sourceOrigin,sourceRotation))continue;
+      const QQuaternion rotation=(referenceRotation*sourceRotation.conjugated()).normalized();
+      roomTransforms_[sensor]={rotation,referenceOrigin-rotation.rotatedVector(sourceOrigin)};
+      ++aligned;
+    }
+    status_->setText(QString("Aligned %1 other sensor(s) from the shared pose").arg(aligned));
+  }
+  void setRoomPlacement() {
+    const bool remote=captureMode_->currentIndex()==3;
+    const QString primary=remote?(remoteSensorOrder_.empty()?QString():remoteSensorOrder_.front()):devices_->currentData().toString();
+    if(roomReferenceSensor_!=primary) {
+      roomTransforms_.clear();roomReferenceSensor_=primary;
+    }
+    QDialog dialog(this);dialog.setWindowTitle("Measured sensor placement");
+    auto* layout=new QVBoxLayout(&dialog);
+    auto* note=new QLabel("Enter each camera's position and yaw relative to the selected sensor. Metres and degrees; camera 1 is the room origin.");
+    note->setWordWrap(true);layout->addWidget(note);
+    auto* form=new QFormLayout;layout->addLayout(form);
+    struct Fields {QString id;QDoubleSpinBox *x,*y,*z,*yaw;};
+    std::vector<Fields> fields;
+    QStringList sensors;
+    if(remote)for(const QString& sensor:remoteSensorOrder_)sensors.append(sensor);
+    else for(const Device& device:found_)sensors.append(device.id);
+    for(const QString& sensor:sensors) {
+      if(sensor==primary)continue;
+      auto* row=new QWidget(&dialog);auto* line=new QHBoxLayout(row);
+      line->setContentsMargins(0,0,0,0);
+      Fields field{sensor,nullptr,nullptr,nullptr,nullptr};
+      for(auto [name,slot]:{std::pair<const char*,QDoubleSpinBox**>{"X",&field.x},
+          {"Y",&field.y},{"Z",&field.z},{"Yaw",&field.yaw}}) {
+        line->addWidget(new QLabel(name));
+        *slot=new QDoubleSpinBox(row);(*slot)->setRange(-20,20);(*slot)->setDecimals(2);
+        if(QString(name)=="Yaw")(*slot)->setRange(-180,180);
+        line->addWidget(*slot);
+      }
+      const RoomTransform prior=roomTransforms_.value(sensor);
+      field.x->setValue(prior.translation.x());field.y->setValue(prior.translation.y());
+      field.z->setValue(prior.translation.z());
+      field.yaw->setValue(prior.rotation.toEulerAngles().y());
+      fields.push_back(field);form->addRow(sensor,row);
+    }
+    auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);
+    connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);layout->addWidget(buttons);
+    if(dialog.exec()!=QDialog::Accepted)return;
+    for(const Fields& field:fields)
+      roomTransforms_[field.id]={QQuaternion::fromAxisAndAngle(0,1,0,float(field.yaw->value())),
+          QVector3D(float(field.x->value()),float(field.y->value()),float(field.z->value()))};
+    status_->setText(QString("Measured placement set for %1 sensor(s)").arg(fields.size()));
+  }
+  static QJsonObject combineFaces(const std::vector<std::pair<QString,QJsonObject>>& views) {
+    double bestConfidence=0;
+    QJsonObject best;
+    QString bestSensor;
+    for(const auto& view:views) {
+      const QJsonObject face=view.second;
+      const double confidence=face.value("confidence").toDouble();
+      if(face.value("tracked").toBool()&&confidence>bestConfidence) {
+        best=face;bestSensor=view.first;bestConfidence=confidence;
+      }
+    }
+    if(best.isEmpty())return {};
+    QJsonObject sums,weights;
+    QJsonArray sources;
+    for(const auto& view:views) {
+      const QJsonObject face=view.second;
+      const double confidence=face.value("confidence").toDouble();
+      if(!face.value("tracked").toBool()||confidence<.55||
+         confidence<bestConfidence*.75)continue;
+      const QJsonObject shapes=face.value("blendshapes").toObject();
+      if(shapes.isEmpty())continue;
+      const double weight=confidence*confidence;
+      for(auto it=shapes.begin();it!=shapes.end();++it)if(it.value().isDouble()) {
+        sums[it.key()]=sums.value(it.key()).toDouble()+weight*it.value().toDouble();
+        weights[it.key()]=weights.value(it.key()).toDouble()+weight;
+      }
+      sources.append(view.first);
+    }
+    QJsonObject blended=best.value("blendshapes").toObject();
+    if(sources.isEmpty())sources.append(bestSensor);
+    for(auto it=sums.begin();it!=sums.end();++it)
+      blended[it.key()]=std::clamp(it.value().toDouble()/weights.value(it.key()).toDouble(),0.,1.);
+    best["blendshapes"]=blended;
+    best["sourceSensor"]=bestSensor;
+    best["sources"]=sources;
+    best["fusion"]=sources.size()>1?"weighted-expressions+best-mesh":"best-view";
+    return best;
+  }
+  QJsonObject fuseLocalPose(QJsonObject primary) const {
+    if(activeCaptureMode_!=1&&activeCaptureMode_!=4)return primary;
+    const auto& observations=activeCaptureMode_==4?remotePoses_:localPoses_;
+    const auto& times=activeCaptureMode_==4?remotePoseTimes_:localPoseTimes_;
+    const qint64 freshness=activeCaptureMode_==4?250:200;
+    std::vector<std::pair<QString,QJsonObject>> faceViews;
+    faceViews.emplace_back(primary.value("device").toString(),primary.value("face").toObject());
+    const qint64 now=QDateTime::currentMSecsSinceEpoch();
+    for(auto it=observations.cbegin();it!=observations.cend();++it) {
+      if(it.key()==primary.value("device").toString()||now-times.value(it.key(),0)>freshness)continue;
+      faceViews.emplace_back(it.key(),QJsonDocument::fromJson(it.value()).object().value("face").toObject());
+    }
+    const QJsonArray bodies=primary.value("bodies").toArray();
+    if(bodies.isEmpty()) {
+      for(auto it=observations.cbegin();it!=observations.cend();++it) {
+        if(it.key()==primary.value("device").toString()||now-times.value(it.key(),0)>freshness)continue;
+        const QJsonObject observation=QJsonDocument::fromJson(it.value()).object();
+        if(!primary.value("tracked").toBool()&&observation.value("tracked").toBool()&&
+           (primary.value("bodies").toArray().isEmpty()||
+            observation.value("observed").toInt()>primary.value("observed").toInt())) {
+          primary=observation;
+          primary["sourceSensor"]=it.key();
+        }
+      }
+      const QJsonObject face=combineFaces(faceViews);
+      if(!face.isEmpty())primary["face"]=face;
+      return primary;
+    }
+    QJsonObject body=bodies.first().toObject();
+    QJsonObject joints=body.value("joints").toObject();
+    auto point=[](const QJsonObject& js,const char* name,QVector3D& out)->bool {
+      const QJsonObject j=js.value(QLatin1String(name)).toObject();
+      const QJsonArray p=j.value("p").toArray();
+      if(p.size()!=3||j.value("c").toDouble()<=0)return false;
+      out=QVector3D(float(p[0].toDouble()),float(p[1].toDouble()),float(p[2].toDouble()));
+      return true;
+    };
+    struct Basis {QVector3D origin,right,up,forward;};
+    auto basis=[&](const QJsonObject& js,Basis& b)->bool {
+      QVector3D sl,sr,hl,hr;
+      if(!point(js,"shoulderL",sl)||!point(js,"shoulderR",sr)||
+         !point(js,"hipL",hl)||!point(js,"hipR",hr))return false;
+      b.origin=(sl+sr+hl+hr)*.25f;
+      b.right=sr-sl;b.up=(sl+sr-hl-hr)*.5f;
+      const float shoulder=b.right.length(),height=b.up.length();
+      if(shoulder<.2f||shoulder>.8f||height<.25f||height>.9f)return false;
+      b.right.normalize();b.up-=b.right*QVector3D::dotProduct(b.up,b.right);
+      if(b.up.length()<.15f)return false;
+      b.up.normalize();b.forward=QVector3D::crossProduct(b.right,b.up).normalized();
+      return true;
+    };
+    Basis reference;
+    if(!basis(joints,reference)) {
+      const QJsonObject face=combineFaces(faceViews);
+      if(!face.isEmpty())primary["face"]=face;
+      return primary;
+    }
+    QJsonArray contributors{primary.value("device").toString()};
+    for(auto it=observations.cbegin();it!=observations.cend();++it) {
+      if(it.key()==primary.value("device").toString()||now-times.value(it.key(),0)>freshness)continue;
+      const QJsonObject observed=QJsonDocument::fromJson(it.value()).object();
+      const QJsonArray otherBodies=observed.value("bodies").toArray();
+      if(otherBodies.isEmpty())continue;
+      const QJsonObject otherJoints=otherBodies.first().toObject().value("joints").toObject();
+      Basis source;
+      if(!basis(otherJoints,source))continue;
+      auto transform=[&](const QVector3D& p) {
+        const QVector3D d=p-source.origin;
+        return reference.origin+reference.right*QVector3D::dotProduct(d,source.right)+
+            reference.up*QVector3D::dotProduct(d,source.up)+
+            reference.forward*QVector3D::dotProduct(d,source.forward);
+      };
+      QVector3D sourceShoulder,referenceShoulder;
+      point(otherJoints,"shoulderL",sourceShoulder);
+      point(joints,"shoulderL",referenceShoulder);
+      if((transform(sourceShoulder)-referenceShoulder).length()>.18f)continue;
+      int accepted=0;
+      for(auto joint=otherJoints.begin();joint!=otherJoints.end();++joint) {
+        const QJsonObject candidate=joint.value().toObject();
+        const QJsonArray position=candidate.value("p").toArray();
+        const double confidence=candidate.value("c").toDouble();
+        if(position.size()!=3||confidence<.2)continue;
+        const QVector3D mapped=transform(QVector3D(float(position[0].toDouble()),
+            float(position[1].toDouble()),float(position[2].toDouble())));
+        QVector3D existing;
+        const bool hasExisting=point(joints,joint.key().toUtf8().constData(),existing);
+        if(hasExisting&&(mapped-existing).length()>.25f)continue;
+        if(hasExisting&&joints.value(joint.key()).toObject().value("c").toDouble()>=confidence)continue;
+        QJsonObject fused=candidate;
+        fused["p"]=QJsonArray{mapped.x(),mapped.y(),mapped.z()};
+        fused.remove("uv");
+        joints[joint.key()]=fused;
+        ++accepted;
+      }
+      if(accepted)contributors.append(it.key());
+    }
+    if(contributors.size()>1) {
+      body["joints"]=joints;primary["bodies"]=QJsonArray{body};
+      primary["observed"]=joints.size();primary["sensors"]=contributors;
+    }
+    const QJsonObject face=combineFaces(faceViews);
+    if(!face.isEmpty())primary["face"]=face;
+    return primary;
+  }
   void updateSensorRow(const QString& sensor,const QString& source,int joints,const QString& status) {
     int row=-1;
     for(int i=0;i<sensors_->rowCount();++i)
@@ -2741,10 +2911,19 @@ class MotionCaptureWindow : public QMainWindow {
     }),found_.end());
     devices_->clear();for(const auto& d:found_) devices_->addItem(d.label,d.id);
     const int index=devices_->findData(selected);if(index>=0) devices_->setCurrentIndex(index);
+    sensors_->setRowCount(0);
+    updateSensorRow("local","USB",0,"Not started");
+    for(const Device& device:found_)updateSensorRow(device.id,"USB",0,"Ready");
+    for(const QString& sensor:remoteSensorOrder_) {
+      const QJsonObject observation=QJsonDocument::fromJson(remotePoses_.value(sensor)).object();
+      updateSensorRow(sensor,"LAN",observation.value("observed").toInt(),"Last LAN observation");
+    }
     status_->setText(QString("%1 RGB-D camera(s) available").arg(found_.size()));
   }
   void start() {
     stop();
+    refresh();
+    selectedSensor_="local";
     const bool bodyOn=bodyEnabled_->isChecked(),faceOn=faceEnabled_->isChecked();
     if(!bodyOn&&!faceOn) {
       status_->setText("Select Body + hands, Face, or both before tracking.");return;
@@ -2760,9 +2939,28 @@ class MotionCaptureWindow : public QMainWindow {
     history_.clear();historyBytes_=0;timeline_->setRange(0,0);live_=true;playing_=false;
     faceFrames_=0;fullBodyFrames_=0;maxPoseBytes_=0;
     playButton_->setText("Play");timelineLabel_->setText("00:00 / LIVE");
+    const bool controllerOnly=captureMode_->currentIndex()>=3;
     const int index=devices_->currentIndex();
-    if(index<0||index>=int(found_.size())) return;
-    const Device d=found_[size_t(index)];
+    if(!controllerOnly&&(index<0||index>=int(found_.size()))) {
+      status_->setText("Select a ready sensor and start tracking.");return;
+    }
+    if(!controllerOnly&&captureMode_->currentIndex()!=0&&found_.size()<2) {
+      status_->setText("Connect at least two ready local sensors for this capture layout.");return;
+    }
+    if(controllerOnly&&!lan_.hosting()) {
+      status_->setText("In Sensors & LAN, click Listen as controller before starting capture.");return;
+    }
+    const Device d=controllerOnly?Device{}:found_[size_t(index)];
+    if(!controllerOnly&&roomReferenceSensor_!=d.id) {
+      roomTransforms_.clear();roomReferenceSensor_=d.id;
+    }
+    activeCaptureMode_=captureMode_->currentIndex();
+    captureMode_->setEnabled(false);
+    captureSensors_=found_;
+    activePrimarySensor_=d.id;
+    qInfo("Mocap session: mode %d, %zu ready sensors, primary %s",
+        activeCaptureMode_,captureSensors_.size(),qPrintable(d.id));
+    if(!controllerOnly)updateSensorRow(d.id,"USB",0,"Primary starting");
     network_.setJsonTarget(QHostAddress::LocalHost,quint16(jsonPort_->value()));
     network_.setOscTarget(QHostAddress::LocalHost,quint16(oscPort_->value()));
     network_.setVmcTarget(QHostAddress::LocalHost,quint16(vmcPort_->value()));
@@ -2772,20 +2970,82 @@ class MotionCaptureWindow : public QMainWindow {
     network_.setVmcEnabled(vmcEnabled_->isChecked());
     network_.setFaceCapEnabled(faceCapEnabled_->isChecked());
     if(webEnabled_->isChecked()&&!web_.start(quint16(webPort_->value()))) {
-      status_->setText("WebSocket: "+web_.error());return;
+      status_->setText("WebSocket: "+web_.error());
+      captureMode_->setEnabled(true);captureSensors_.clear();return;
     }
-    worker_=new StreamWorker(d,bodyOn?5u:1u,bodyOn?(faceOn?5:7):6,this);
-    connect(worker_,&StreamWorker::frameReady,this,[this](const QImage& image){
-      lastFrame_=image;
-      if(selectedSensor_=="local")stage_->setFrame(image);
-    });
-    connect(worker_,&StreamWorker::poseReady,this,[this](const QByteArray& rawPose){
-      const QJsonObject rawRoot=QJsonDocument::fromJson(rawPose).object();
+    if(!controllerOnly) {
+      worker_=new StreamWorker(d,bodyOn?5u:1u,bodyOn?(faceOn?5:7):6,this);
+      connect(worker_,&StreamWorker::frameReady,this,[this](const QImage& image){
+        lastFrame_=image;
+        if(selectedSensor_=="local")stage_->setFrame(image);
+      });
+    }
+    processPose_=[this](const QByteArray& rawPose){
+      latestPrimaryPose_=rawPose;
+      QJsonObject rawRoot=QJsonDocument::fromJson(rawPose).object();
+      if(activeCaptureMode_==1||activeCaptureMode_==4)rawRoot=fuseLocalPose(rawRoot);
+      else if(activeCaptureMode_==2||activeCaptureMode_==3) {
+        QJsonArray tracks;
+        auto addTrack=[&](const QString& id,const QString& sensor,const QJsonObject& observation) {
+          tracks.append(QJsonObject{{"id",id},{"sensor",sensor},
+              {"tracked",observation.value("tracked")},{"observed",observation.value("observed")},
+              {"bodies",observation.value("bodies")},{"face",observation.value("face")}});
+        };
+        int person=1;
+        if(activeCaptureMode_==2) {
+          addTrack(QString("person-%1").arg(person++),rawRoot.value("device").toString(),rawRoot);
+          for(const Device& device:captureSensors_) {
+          if(device.id==rawRoot.value("device").toString())continue;
+          QJsonObject observation;
+          if(QDateTime::currentMSecsSinceEpoch()-localPoseTimes_.value(device.id,0)<=200)
+            observation=QJsonDocument::fromJson(localPoses_.value(device.id)).object();
+          addTrack(QString("person-%1").arg(person++),device.id,observation);
+          }
+        } else for(const QString& sensor:remoteSensorOrder_) {
+          QJsonObject observation;
+          if(sensor==rawRoot.value("device").toString())observation=rawRoot;
+          else if(QDateTime::currentMSecsSinceEpoch()-remotePoseTimes_.value(sensor,0)<=250)
+            observation=QJsonDocument::fromJson(remotePoses_.value(sensor)).object();
+          addTrack(QString("person-%1").arg(person++),sensor,observation);
+        }
+        rawRoot["tracks"]=tracks;
+      }
       QElapsedTimer fitTimer;
       const bool profileFit=!qEnvironmentVariableIsEmpty("REMOLD_PROFILE_MOCAP");
       if(profileFit)fitTimer.start();
       QJsonObject smoothed=smoother_.filter(rawRoot);
       QJsonObject root=fitEnabled_->isChecked()?bodyFit_.fit(std::move(smoothed)):std::move(smoothed);
+      if(activeCaptureMode_==2||activeCaptureMode_==3) {
+        QJsonArray tracks=rawRoot.value("tracks").toArray();
+        for(int i=0;i<tracks.size();++i) {
+          QJsonObject track=tracks[i].toObject();
+          if(track.value("sensor")==root.value("device")) {
+            track["bodies"]=root.value("bodies");track["face"]=root.value("face");
+            track["tracked"]=root.value("tracked");track["observed"]=root.value("observed");
+          } else {
+            const QString id=track.value("id").toString();
+            QJsonObject frame{{"v",1},{"device",track.value("sensor")},{"t",root.value("t")},
+                {"frame",root.value("frame")},{"space","camera"},{"tracked",track.value("tracked")},
+                {"observed",track.value("observed")},{"bodies",track.value("bodies")},
+                {"face",track.value("face")}};
+            trackSmoothers_[id].setStability(stability_->value());
+            frame=trackSmoothers_[id].filter(frame);
+            if(fitEnabled_->isChecked())frame=trackFits_[id].fit(frame);
+            track["bodies"]=frame.value("bodies");track["face"]=frame.value("face");
+            track["tracked"]=frame.value("tracked");track["observed"]=frame.value("observed");
+          }
+          tracks[i]=track;
+        }
+        for(int i=0;i<tracks.size();++i) {
+          QJsonObject track=tracks[i].toObject();
+          const QString sensor=track.value("sensor").toString();
+          if(i==0)track["space"]="room";
+          else if(roomTransforms_.contains(sensor))track=roomTrack(track,roomTransforms_.value(sensor));
+          else track["space"]="camera";
+          tracks[i]=track;
+        }
+        root["tracks"]=tracks;
+      }
       if(profileFit) {
         fitMs_+=fitTimer.nsecsElapsed()*1e-6;
         if(++fitFrames_%120==0)qInfo("Mocap filter + solve ms/frame (%d): %.3f",
@@ -2881,6 +3141,33 @@ class MotionCaptureWindow : public QMainWindow {
         }
         face["neutralCalibrated"]=true;root["face"]=face;
       }
+      if(activeCaptureMode_==2||activeCaptureMode_==3) {
+        QJsonArray tracks=root.value("tracks").toArray();
+        if(!tracks.isEmpty()) {
+          QJsonObject first=tracks[0].toObject();first["face"]=root.value("face");
+          tracks[0]=first;root["tracks"]=tracks;
+        }
+      }
+      if(activeCaptureMode_==2||activeCaptureMode_==3) {
+        QStringList states;
+        for(const QJsonValue& value:root.value("tracks").toArray()) {
+          const QJsonObject track=value.toObject();
+          states.append(QString("%1: body %2 · face %3 · %4")
+              .arg(track.value("id").toString(),track.value("tracked").toBool()?"tracked":"searching",
+                   track.value("face").toObject().value("tracked").toBool()?"tracked":"searching",
+                   track.value("space").toString()));
+        }
+        for(auto it=observerErrors_.cbegin();it!=observerErrors_.cend();++it)
+          states.append(QString("%1: %2").arg(it.key(),it.value()));
+        peopleStatus_->setText(states.join("  |  "));
+      } else if(activeCaptureMode_==1||activeCaptureMode_==4) {
+        const QJsonArray bodySensors=root.value("sensors").toArray();
+        const QJsonObject fusedFace=root.value("face").toObject();
+        const QJsonArray faceSensors=fusedFace.value("sources").toArray();
+        peopleStatus_->setText(QString("One-person solve · body %1 sensor(s) · face %2 sensor(s) · mesh: %3")
+            .arg(std::max<qsizetype>(1,bodySensors.size())).arg(faceSensors.size())
+            .arg(fusedFace.value("sourceSensor").toString("none")));
+      } else peopleStatus_->setText("One-person capture · selected sensor");
       root["quality"]=updateCaptureQuality(root);
       updateFitCheck(root);
       const QByteArray pose=QJsonDocument(root).toJson(QJsonDocument::Compact);
@@ -2908,9 +3195,11 @@ class MotionCaptureWindow : public QMainWindow {
         if(complete)++fullBodyFrames_;
       }
       maxPoseBytes_=std::max(maxPoseBytes_,int(pose.size()));
-      updateSensorRow("local","USB",root.value("observed").toInt(),
+      updateSensorRow("local",activeCaptureMode_>=3?"LAN":"USB",root.value("observed").toInt(),
                       tracked?"Tracking":"Searching");
-      lan_.broadcastPose(pose);
+      updateSensorRow(root.value("device").toString(),activeCaptureMode_>=3?"LAN":"USB",root.value("observed").toInt(),
+                      tracked?"Primary tracking":"Primary searching");
+      if(activeCaptureMode_<3)lan_.broadcastPose(rawPose);
       const HumanoidPose rig=rig_.retarget(pose,mirrorEnabled_->isChecked());
       history_.push_back(pose);historyBytes_+=size_t(pose.size());
       constexpr size_t previewLimit=64u*1024u*1024u;
@@ -2926,8 +3215,11 @@ class MotionCaptureWindow : public QMainWindow {
       if(!capturePath.isEmpty()&&history_.size()%10==0)
         stage_->grab().save(QString("%1.frame%2.png").arg(capturePath)
             .arg(history_.size(),4,10,QChar('0')),"PNG");
+      QJsonObject unity=unityEnabled_->isChecked()?
+          MocapRig::unityJson(pose,rig,mirrorEnabled_->isChecked()):QJsonObject{};
+      if(unityEnabled_->isChecked()&&root.contains("tracks"))unity["tracks"]=root.value("tracks");
       QByteArray output=unityEnabled_->isChecked()?
-          QJsonDocument(MocapRig::unityJson(pose,rig,mirrorEnabled_->isChecked())).toJson(QJsonDocument::Compact):pose;
+          QJsonDocument(unity).toJson(QJsonDocument::Compact):pose;
       QByteArray recordedOutput=output;
       if(!qEnvironmentVariableIsEmpty("REMOLD_SOLVE_CAPTURE")) {
         QJsonObject diagnosticRoot=root;
@@ -2967,8 +3259,20 @@ class MotionCaptureWindow : public QMainWindow {
           }
         }
       }
+    };
+    if(controllerOnly) {
+      controllerFrame_=0;
+      controllerTimer_.start();
+      status_->setText("Controller capture waiting for LAN sensor observations");
+      return;
+    }
+    connect(worker_,&StreamWorker::poseReady,this,[this](const QByteArray& pose){
+      if(processPose_)processPose_(pose);
     });
-    connect(worker_,&StreamWorker::message,status_,&QLabel::setText);
+    connect(worker_,&StreamWorker::message,this,[this](const QString& message){
+      status_->setText(message);
+      updateSensorRow(activePrimarySensor_,"USB",0,message);
+    });
     connect(worker_,&StreamWorker::providerReady,this,[this](const QString& body,const QString& hands,
         const QString& face){
       providerSummary_=QString("Body %1 · hands %2 · face %3").arg(body,hands,face);
@@ -2981,12 +3285,69 @@ class MotionCaptureWindow : public QMainWindow {
           .arg(lift,0,'f',1).arg(lastFitMs_,0,'f',2));
     });
     worker_->startLatest();
+    if(activeCaptureMode_!=0)for(const Device& other:captureSensors_) {
+      if(other.id==d.id)continue;
+      auto* observer=new StreamWorker(other,bodyOn?5u:1u,bodyOn?(faceOn?5:7):6,this);
+      const QString sensor=other.id;
+      qInfo("Mocap observer starting: %s",qPrintable(sensor));
+      updateSensorRow(sensor,"USB",0,
+          bodyOn?(faceOn?"Starting body + face":"Starting body"):
+              "Starting face");
+      connect(observer,&StreamWorker::frameReady,this,[this,sensor](const QImage& image){
+        localFrames_[sensor]=image;
+        if(selectedSensor_==sensor)stage_->setFrame(image);
+      });
+      connect(observer,&StreamWorker::poseReady,this,[this,sensor](const QByteArray& pose){
+        lan_.broadcastPose(pose);
+        localPoses_[sensor]=pose;
+        localPoseTimes_[sensor]=QDateTime::currentMSecsSinceEpoch();
+        observerRestarts_[sensor]=0;
+        observerErrors_.remove(sensor);
+        const QJsonObject root=QJsonDocument::fromJson(pose).object();
+        updateSensorRow(sensor,"USB",root.value("observed").toInt(),
+            root.value("tracked").toBool()?"Observed":"Searching");
+        if(selectedSensor_==sensor)stage_->setPose(pose);
+      });
+      connect(observer,&StreamWorker::message,this,[this,sensor](const QString& message){
+        qWarning("Mocap observer %s: %s",qPrintable(sensor),qPrintable(message));
+        if(message.startsWith("Streaming "))observerErrors_.remove(sensor);
+        else observerErrors_[sensor]=message;
+        updateSensorRow(sensor,"USB",0,message);
+      });
+      connect(observer,&QThread::finished,this,[this,observer,sensor]{
+        if(std::find(observers_.begin(),observers_.end(),observer)==observers_.end()||
+           !worker_||!worker_->isRunning())return;
+        int& attempts=observerRestarts_[sensor];
+        if(attempts>=5) {
+          const QString reason=observerErrors_.value(sensor,"stream ended");
+          updateSensorRow(sensor,"USB",0,"Stopped after 5 retries: "+reason);return;
+        }
+        ++attempts;
+        updateSensorRow(sensor,"USB",0,QString("Retrying stream (%1/5)").arg(attempts));
+        QTimer::singleShot(std::min(8000,1000*attempts),this,[this,observer,sensor]{
+          if(std::find(observers_.begin(),observers_.end(),observer)==observers_.end()||
+             !worker_||!worker_->isRunning()||observer->isRunning())return;
+          updateSensorRow(sensor,"USB",0,"Restarting stream");
+          observer->startLatest();
+        });
+      });
+      observers_.push_back(observer);
+      observer->startLatest();
+    }
   }
   void stop() {
+    controllerTimer_.stop();processPose_={};
     ++calibrationGeneration_;calibrating_=false;
     cancelGuide(false);
     checkActive_=false;checkPending_=false;
     checkTimer_.stop();
+    for(StreamWorker* observer:observers_)observer->requestInterruption();
+    for(StreamWorker* observer:observers_) {observer->wait();delete observer;}
+    observers_.clear();localFrames_.clear();localPoses_.clear();localPoseTimes_.clear();
+    observerRestarts_.clear();observerErrors_.clear();
+    latestPrimaryPose_.clear();
+    captureSensors_.clear();activePrimarySensor_.clear();captureMode_->setEnabled(true);
+    trackSmoothers_.clear();trackFits_.clear();
     if(worker_) {worker_->requestInterruption();worker_->wait();delete worker_;worker_=nullptr;}
     web_.stop();
     stopRecording();
@@ -3377,6 +3738,12 @@ class MotionCaptureWindow : public QMainWindow {
     auto* smoothing=new QSlider(Qt::Horizontal,&dialog);
     smoothing->setRange(0,100);smoothing->setValue(0);
     form->addRow("Noise reduction",smoothing);
+    auto* people=new QComboBox(&dialog);
+    people->addItems({"All people", "Person 1 only", "Person 2 only"});
+    form->addRow("Apply processing to",people);
+    auto* trackIds=new QLineEdit(&dialog);
+    trackIds->setPlaceholderText("Optional IDs, e.g. person-2, person-3");
+    form->addRow("Specific people",trackIds);
     auto* inPlace=new QCheckBox("Remove root travel for an in-place loop",&dialog);
     inPlace->setChecked(true);form->addRow(inPlace);
     auto* exportBvh=new QCheckBox("Export edited BVH alongside JSONL",&dialog);
@@ -3393,6 +3760,12 @@ class MotionCaptureWindow : public QMainWindow {
     options.trimStart=trimStart->value();options.trimEnd=trimEnd->value();
     options.faceOffset=faceOffset->value();options.loopBlend=loopBlend->value();
     options.smoothing=smoothing->value();options.inPlaceLoop=inPlace->isChecked();
+    if(people->currentIndex()==1)options.selectedTracks={"person-1"};
+    if(people->currentIndex()==2)options.selectedTracks={"person-2"};
+    if(!trackIds->text().trimmed().isEmpty()) {
+      options.selectedTracks=trackIds->text().split(',',Qt::SkipEmptyParts);
+      for(QString& id:options.selectedTracks)id=id.trimmed();
+    }
     if(exportBvh->isChecked()) {
       options.bvhOutput=options.output;
       if(options.bvhOutput.endsWith(".jsonl",Qt::CaseInsensitive))options.bvhOutput.chop(6);
@@ -3431,11 +3804,13 @@ class MotionCaptureWindow : public QMainWindow {
       status_->setText(file_.errorString());file_.cancelWriting();return;
     }
     recorded_=0;recordedBytes_=compactRecording_?4:0;recording_=true;
+    startCaptureAudio(path);
     recordButton_->setText("Stop recording");
     QApplication::beep();
   }
   void stopRecording() {
     if(!recording_) return;
+    stopCaptureAudio();
     const bool saved=file_.commit();recording_=false;
     recordButton_->setText("Record clip");
     QApplication::beep();QTimer::singleShot(220,this,[]{QApplication::beep();});
@@ -3443,7 +3818,159 @@ class MotionCaptureWindow : public QMainWindow {
     if(saved)storage_->setText(QString("Saved %1 MiB · preview remains capped at 64 MiB")
         .arg(recordedBytes_/(1024.0*1024.0),0,'f',1));
   }
+  void refreshAudioInputs() {
+    QSignalBlocker blocked(audioInputs_);
+    QHash<QByteArray,Qt::CheckState> previous;
+    for(int i=0;i<audioInputs_->count();++i) {
+      auto* item=audioInputs_->item(i);
+      previous[item->data(Qt::UserRole).toByteArray()]=item->checkState();
+    }
+    audioInputs_->clear();
+    for(const QAudioDevice& device:QMediaDevices::audioInputs()) {
+      const QRegularExpression kinectName("kinect|xbox|nui|045e",
+          QRegularExpression::CaseInsensitiveOption);
+      if(device.maximumChannelCount()<4||
+         (!device.description().contains(kinectName)&&
+          !QString::fromUtf8(device.id()).contains(kinectName)))continue;
+      auto* item=new QListWidgetItem(device.description()+" · "+QString::fromUtf8(device.id()).right(12),audioInputs_);
+      const QString serial=QString::fromUtf8(device.id()).section(':',-2,-2);
+      QString sensorId;
+      for(const Device& sensor:found_)
+        if(!serial.isEmpty()&&sensor.id.endsWith("-"+serial)) {sensorId=sensor.id;break;}
+      if(!sensorId.isEmpty())item->setText(sensorId+" · "+device.description());
+      item->setData(Qt::UserRole,device.id());
+      item->setData(Qt::UserRole+1,sensorId);
+      item->setFlags(item->flags()|Qt::ItemIsUserCheckable);
+      item->setCheckState(previous.value(device.id(),audioSelectionTouched_?Qt::Unchecked:Qt::Checked));
+      item->setToolTip(QString::fromUtf8(device.id()));
+    }
+    audioStatus_->setText(audioInputs_->count()?QString("%1 Kinect audio input(s); checked inputs record with each clip")
+        .arg(audioInputs_->count()):"No four-channel Kinect audio input available in CoreAudio");
+    applyDefaultAudioSelection();
+  }
+  void applyDefaultAudioSelection() {
+    if(audioSelectionTouched_||!audioInputs_)return;
+    QSignalBlocker blocked(audioInputs_);
+    const int mode=captureMode_->currentIndex();
+    const QString selected=devices_->currentData().toString();
+    for(int i=0;i<audioInputs_->count();++i) {
+      auto* item=audioInputs_->item(i);
+      const QString sensor=item->data(Qt::UserRole+1).toString();
+      item->setCheckState((mode==1||mode==2||
+          (mode==0&&!sensor.isEmpty()&&sensor==selected))?Qt::Checked:Qt::Unchecked);
+    }
+  }
+  struct CaptureAudio {
+    QString path,description,sensorId;
+    QByteArray id;
+    QAudioFormat format;
+    QSaveFile file;
+    std::unique_ptr<QAudioSource> source;
+    QIODevice* stream=nullptr;
+    quint64 bytes=0;
+    qint64 firstUtcMs=0;
+  };
+  static QAudioFormat captureAudioFormat(const QAudioDevice& device) {
+    for(int rate:{16000,48000})for(auto sample:{QAudioFormat::Int32,QAudioFormat::Int16,QAudioFormat::Float}) {
+      QAudioFormat format;format.setSampleRate(rate);format.setChannelCount(4);
+      format.setSampleFormat(sample);
+      if(device.isFormatSupported(format))return format;
+    }
+    QAudioFormat preferred=device.preferredFormat();
+    return preferred.channelCount()>=4?preferred:QAudioFormat{};
+  }
+  static QByteArray wavHeader(const QAudioFormat& format,quint32 bytes=0) {
+    const bool floating=format.sampleFormat()==QAudioFormat::Float;
+    QByteArray header(floating?58:44,0);
+    auto put16=[&](int at,quint16 value){std::memcpy(header.data()+at,&value,2);};
+    auto put32=[&](int at,quint32 value){std::memcpy(header.data()+at,&value,4);};
+    std::memcpy(header.data(),"RIFF",4);put32(4,bytes+quint32(header.size())-8);
+    std::memcpy(header.data()+8,"WAVEfmt ",8);put32(16,floating?18:16);
+    put16(20,floating?3:1);
+    put16(22,quint16(format.channelCount()));put32(24,quint32(format.sampleRate()));
+    put32(28,quint32(format.sampleRate()*format.bytesPerFrame()));
+    put16(32,quint16(format.bytesPerFrame()));put16(34,quint16(format.bytesPerSample()*8));
+    if(floating) {
+      put16(36,0);std::memcpy(header.data()+38,"fact",4);put32(42,4);
+      put32(46,format.bytesPerFrame()?bytes/quint32(format.bytesPerFrame()):0);
+    }
+    const int dataAt=floating?50:36;
+    std::memcpy(header.data()+dataAt,"data",4);put32(dataAt+4,bytes);return header;
+  }
+  void startCaptureAudio(const QString& clipPath) {
+    refreshAudioInputs();
+    int number=0;
+    for(int i=0;i<audioInputs_->count();++i) {
+      const auto* item=audioInputs_->item(i);
+      if(item->checkState()!=Qt::Checked)continue;
+      const QByteArray id=item->data(Qt::UserRole).toByteArray();
+      for(const QAudioDevice& device:QMediaDevices::audioInputs())if(device.id()==id) {
+        const QAudioFormat format=captureAudioFormat(device);
+        if(!format.isValid()) {audioStatus_->setText("Kinect input has no supported four-channel format");break;}
+        auto capture=std::make_unique<CaptureAudio>();
+        capture->id=id;capture->description=device.description();
+        capture->sensorId=item->data(Qt::UserRole+1).toString();capture->format=format;
+        capture->path=clipPath+QString(".audio-%1.wav").arg(++number);
+        capture->file.setFileName(capture->path);
+        const QByteArray header=wavHeader(format);
+        if(!capture->file.open(QIODevice::WriteOnly)||capture->file.write(header)!=header.size()) {
+          audioStatus_->setText("Could not open sensor audio WAV: "+capture->file.errorString());break;
+        }
+        capture->source=std::make_unique<QAudioSource>(device,format);
+        connect(capture->source.get(),&QAudioSource::stateChanged,this,[this,source=capture->source.get()](QAudio::State){
+          if(recording_&&source->error()!=QAudio::NoError)
+            audioStatus_->setText("Sensor audio input failed during recording");
+        });
+        capture->stream=capture->source->start();
+        if(!capture->stream) {capture->file.cancelWriting();audioStatus_->setText("Could not start Kinect audio input");break;}
+        CaptureAudio* active=capture.get();
+        connect(active->stream,&QIODevice::readyRead,this,[active]{
+          const QByteArray pcm=active->stream->readAll();
+          if(pcm.isEmpty())return;
+          if(!active->firstUtcMs)active->firstUtcMs=QDateTime::currentMSecsSinceEpoch();
+          if(active->file.write(pcm)==pcm.size())active->bytes+=quint64(pcm.size());
+        });
+        captureAudio_.push_back(std::move(capture));
+        break;
+      }
+    }
+    if(!captureAudio_.empty())audioStatus_->setText(QString("Recording %1 Kinect audio input(s)").arg(captureAudio_.size()));
+  }
+  void stopCaptureAudio() {
+    const size_t count=captureAudio_.size();
+    size_t saved=0;
+    for(auto& capture:captureAudio_) {
+      if(capture->stream) {
+        const QByteArray remaining=capture->stream->readAll();
+        if(!remaining.isEmpty()&&capture->file.write(remaining)==remaining.size())capture->bytes+=quint64(remaining.size());
+      }
+      capture->source->stop();
+      const QByteArray header=wavHeader(capture->format,quint32(capture->bytes));
+      if(capture->bytes>0xffffffffu-quint64(header.size()-8)||!capture->file.seek(0)||
+         capture->file.write(header)!=header.size()||
+         !capture->file.commit()) {
+        audioStatus_->setText("Could not finalize sensor audio WAV");continue;
+      }
+      ++saved;
+      QSaveFile sidecar(capture->path+".json");
+      if(sidecar.open(QIODevice::WriteOnly)) {
+        const QJsonObject metadata{{"deviceId",QString::fromUtf8(capture->id)},
+            {"deviceName",capture->description},{"sensorId",capture->sensorId},
+            {"sampleRate",capture->format.sampleRate()},
+            {"channels",capture->format.channelCount()},{"bytes",double(capture->bytes)},
+            {"firstAudioReceivedUtcMs",double(capture->firstUtcMs)}};
+        sidecar.write(QJsonDocument(metadata).toJson());sidecar.commit();
+      }
+    }
+    captureAudio_.clear();
+    if(count&&saved==count)
+      audioStatus_->setText(QString("Saved %1 sensor audio WAV(s) beside the motion clip").arg(saved));
+  }
   std::vector<Device> found_;
+  QListWidget* audioInputs_=nullptr;
+  QLabel* audioStatus_=nullptr;
+  bool audioSelectionTouched_=false;
+  std::vector<std::unique_ptr<CaptureAudio>> captureAudio_;
   QComboBox* devices_=nullptr;QCheckBox* jsonEnabled_=nullptr;QCheckBox* oscEnabled_=nullptr;
   QCheckBox* webEnabled_=nullptr;QCheckBox* vmcEnabled_=nullptr;QCheckBox* faceCapEnabled_=nullptr;
   QCheckBox* unityEnabled_=nullptr;QCheckBox* mirrorEnabled_=nullptr;
@@ -3482,12 +4009,31 @@ class MotionCaptureWindow : public QMainWindow {
   QFile clipFile_;std::shared_ptr<MocapClipIndex> clipIndex_;
   QPushButton* playButton_=nullptr;QPushButton* liveButton_=nullptr;
   QLabel* status_=nullptr;QPushButton* recordButton_=nullptr;QPushButton* bvhButton_=nullptr;
+  QLabel* peopleStatus_=nullptr;
   QComboBox* recordFormat_=nullptr;bool compactRecording_=false;
-  StreamWorker* worker_=nullptr;MocapNetwork network_;MocapWebSocket web_;MocapRig rig_;MocapBvh bvh_;QSaveFile file_;
+  StreamWorker* worker_=nullptr;std::vector<StreamWorker*> observers_;
+  QComboBox* captureMode_=nullptr;
+  QLabel* modeHelp_=nullptr;
+  int activeCaptureMode_=0;std::vector<Device> captureSensors_;
+  QString activePrimarySensor_;
+  QHash<QString,QImage> localFrames_;QHash<QString,QByteArray> localPoses_;
+  QHash<QString,qint64> localPoseTimes_;
+  QHash<QString,int> observerRestarts_;
+  QHash<QString,QString> observerErrors_;
+  QHash<QString,RoomTransform> roomTransforms_;
+  QString roomReferenceSensor_;
+  QByteArray latestPrimaryPose_;
+  MocapNetwork network_;MocapWebSocket web_;MocapRig rig_;MocapBvh bvh_;QSaveFile file_;
   MocapPoseSmoother smoother_;
   ArticulatedPoseFit bodyFit_;
+  QHash<QString,MocapPoseSmoother> trackSmoothers_;
+  QHash<QString,ArticulatedPoseFit> trackFits_;
   double fitMs_=0,lastFitMs_=0;int fitFrames_=0;
   LanPoseLink lan_;QHash<QString,QByteArray> remotePoses_;
+  QHash<QString,qint64> remotePoseTimes_;
+  std::vector<QString> remoteSensorOrder_;
+  QTimer controllerTimer_;quint64 controllerFrame_=0;
+  std::function<void(const QByteArray&)> processPose_;
   QString selectedSensor_="local";QImage lastFrame_;
   std::deque<QByteArray> history_;size_t historyBytes_=0;QTimer playback_;bool live_=true,playing_=false;
   bool recording_=false;int recorded_=0,faceFrames_=0,fullBodyFrames_=0,maxPoseBytes_=0;
@@ -3521,8 +4067,6 @@ public:
     auto* refreshButton = new QPushButton("Refresh"); auto* probe = new QPushButton("Probe USB");
     auto* openWindow = new QPushButton("Open sensor window");
     auto* surveillance = new QPushButton("Surveillance");
-    auto* microphones = new QPushButton("Microphones");
-    auto* acoustic = new QPushButton("Acoustic Scanner");
     auto* scanner = new QPushButton("3D Scanner");
 #ifdef REMOLD_HAS_ONNX
     auto* mocap = new QPushButton("Motion Capture");
@@ -3548,8 +4092,7 @@ public:
     row->addWidget(devices_, 1); row->addWidget(modes_); row->addWidget(refreshButton); row->addWidget(openWindow); row->addWidget(probe); row->addWidget(start); row->addWidget(stop);
     layout->addLayout(row);
     auto* modules = new QHBoxLayout;
-    modules->addWidget(surveillance); modules->addWidget(microphones);
-    modules->addWidget(acoustic); modules->addWidget(calibration);
+    modules->addWidget(surveillance); modules->addWidget(calibration);
     modules->addWidget(scanner);
 #ifdef REMOLD_HAS_ONNX
     modules->addWidget(mocap);
@@ -3581,16 +4124,6 @@ public:
     });
     connect(surveillance, &QPushButton::clicked, this, [] {
       auto* window = new SurveillanceWindow;
-      window->setAttribute(Qt::WA_DeleteOnClose);
-      window->show();
-    });
-    connect(microphones, &QPushButton::clicked, this, [] {
-      auto* window = new MicrophoneWindow;
-      window->setAttribute(Qt::WA_DeleteOnClose);
-      window->show();
-    });
-    connect(acoustic, &QPushButton::clicked, this, [] {
-      auto* window = new AcousticWindow;
       window->setAttribute(Qt::WA_DeleteOnClose);
       window->show();
     });
@@ -3985,6 +4518,62 @@ int main(int argc, char** argv) {
       [](const QString& arg){return arg.startsWith("--check-live-")||arg=="--check-stream-handoff";});
   if(!diagnostic||liveDiagnostic)startBundledUsbHost(nativeUsbHost);
 #endif
+  if(app.arguments().contains("--check-audio-inputs")) {
+    int kinectInputs=0;
+    for(const QAudioDevice& device:QMediaDevices::audioInputs()) {
+      fprintf(stdout,"%s\t%s\t%d channels\n",device.id().constData(),
+              qPrintable(device.description()),device.maximumChannelCount());
+      const QRegularExpression kinectName("kinect|xbox|nui|045e",
+          QRegularExpression::CaseInsensitiveOption);
+      if(device.maximumChannelCount()>=4&&
+         (device.description().contains(kinectName)||
+          QString::fromUtf8(device.id()).contains(kinectName)))
+        ++kinectInputs;
+    }
+    return kinectInputs?0:2;
+  }
+  if(app.arguments().contains("--check-audio-capture")) {
+    struct Probe {QString name;std::unique_ptr<QAudioSource> source;QIODevice* stream=nullptr;qint64 bytes=0;};
+    std::vector<std::unique_ptr<Probe>> probes;
+    for(const QAudioDevice& device:QMediaDevices::audioInputs()) {
+      if(device.maximumChannelCount()<4||
+         !device.description().contains(QRegularExpression("kinect|xbox|nui",
+             QRegularExpression::CaseInsensitiveOption)))continue;
+      QAudioFormat format;
+      for(int rate:{16000,48000})for(auto sample:{QAudioFormat::Int32,QAudioFormat::Int16,QAudioFormat::Float}) {
+        QAudioFormat candidate;candidate.setSampleRate(rate);candidate.setChannelCount(4);
+        candidate.setSampleFormat(sample);
+        if(device.isFormatSupported(candidate)&&!format.isValid())format=candidate;
+      }
+      if(!format.isValid())return 3;
+      auto probe=std::make_unique<Probe>();probe->name=device.description();
+      probe->source=std::make_unique<QAudioSource>(device,format);
+      probe->stream=probe->source->start();if(!probe->stream)return 4;
+      Probe* active=probe.get();
+      QObject::connect(active->stream,&QIODevice::readyRead,&app,[active]{
+        active->bytes+=active->stream->readAll().size();
+      });
+      probes.push_back(std::move(probe));
+    }
+    if(probes.empty())return 2;
+    QElapsedTimer timer;timer.start();
+    while(timer.elapsed()<5000) {
+      app.processEvents();QThread::msleep(10);
+      if(std::all_of(probes.begin(),probes.end(),[](const auto& probe){return probe->bytes>0;}))break;
+    }
+    bool good=true;
+    for(auto& probe:probes) {
+      probe->source->stop();
+      fprintf(stdout,"%s: %lld audio bytes, error %d\n",qPrintable(probe->name),
+          static_cast<long long>(probe->bytes),int(probe->source->error()));
+      good&=probe->bytes>0;
+    }
+    return good?0:5;
+  }
+  if(app.arguments().contains("--check-mocap-audio-wav")) {
+    MotionCaptureWindow window;
+    return window.checkAudioWav();
+  }
   if (app.arguments().contains("--check-stream-handoff")) {
     auto sensors=discoverAt(sdkPath(true));
     sensors.erase(std::remove_if(sensors.begin(),sensors.end(),[](const Device& d){
@@ -4005,6 +4594,31 @@ int main(int argc, char** argv) {
     fprintf(stderr,"Stream handoff: first %d frames, second %d frames, previous stopped %d\n",
             firstFrames,secondFrames,!first.isRunning());
     return passed?0:4;
+  }
+  if(app.arguments().contains("--check-live-rgb-timing")) {
+    auto sensors=discoverAt(sdkPath(true));
+    auto ready=std::find_if(sensors.begin(),sensors.end(),[](const Device& device){
+      return device.state=="Ready"&&!device.camera.isEmpty();
+    });
+    if(ready==sensors.end())return 2;
+    StreamWorker worker(*ready,5u,0);
+    std::vector<quint64> depths,colors;
+    QObject::connect(&worker,&StreamWorker::depthStamp,&app,[&](quint64 tick){depths.push_back(tick);});
+    QObject::connect(&worker,&StreamWorker::rgbReady,&app,[&](const QImage&,quint64 tick){colors.push_back(tick);});
+    worker.startLatest();QElapsedTimer timer;timer.start();
+    while(timer.elapsed()<8000) {app.processEvents();QThread::msleep(10);}
+    worker.requestInterruption();worker.wait();
+    std::vector<quint64> skews;
+    for(quint64 depth:depths)if(!colors.empty()) {
+      quint64 best=std::numeric_limits<quint64>::max();
+      for(quint64 color:colors)best=std::min(best,color>depth?color-depth:depth-color);
+      skews.push_back(best);
+    }
+    std::sort(skews.begin(),skews.end());
+    fprintf(stderr,"RGB-D timing: %zu depth, %zu RGB, median nearest skew %llu ms\n",
+        depths.size(),colors.size(),skews.empty()?0ull:
+        static_cast<unsigned long long>(skews[skews.size()/2]));
+    return depths.size()>=3&&colors.size()>=1?0:3;
   }
   if (app.arguments().contains("--check-mocap-smoothing")) {
     MocapPoseSmoother smoother;
@@ -4033,6 +4647,56 @@ int main(int argc, char** argv) {
     fprintf(stderr,"Smoothing: still ratio %.3f, spike %.3f, motion %.3f\n",
             filteredVariation/rawVariation,spike-previous,following);
     return following>.75?0:3;
+  }
+  if (app.arguments().contains("--check-multi-track-clip")) {
+    QTemporaryDir directory;if(!directory.isValid())return 2;
+    const QString input=directory.filePath("people.jsonl");
+    QFile source(input);if(!source.open(QIODevice::WriteOnly))return 3;
+    for(int n=0;n<120;++n) {
+      QJsonArray tracks;
+      for(int person=1;person<=2;++person) {
+        const double x=person*1.5+(n%2?.02:-.02);
+        const QJsonObject joint{{"p",QJsonArray{x,0.,2.}},{"c",.9}};
+        const QJsonObject body{{"id",1},{"joints",QJsonObject{
+            {"hipL",joint},{"hipR",joint},{"shoulderL",joint},
+            {"shoulderR",joint},{"wristL",joint}}}};
+        tracks.append(QJsonObject{{"id",QString("person-%1").arg(person)},
+            {"sensor",QString("sensor-%1").arg(person)},{"tracked",true},
+            {"observed",5},{"bodies",QJsonArray{body}},
+            {"face",QJsonObject{{"tracked",true},{"confidence",.9},
+                {"blendshapes",QJsonObject{{"jawOpen",person*.1}}}}}});
+      }
+      const QJsonObject frame{{"t",1.+n/30.},{"frame",n},{"device","sensor-1"},
+          {"tracked",true},{"bodies",tracks[0].toObject().value("bodies")},
+          {"tracks",tracks}};
+      source.write(QJsonDocument(frame).toJson(QJsonDocument::Compact)+'\n');
+    }
+    source.close();
+    MocapClipOptions options;options.source=input;
+    options.output=directory.filePath("edited.rmclip");
+    options.selectedTracks={"person-2"};options.smoothing=50;options.loopBlend=.2;
+    const auto result=MocapClipProcessor::process(options);
+    if(!result.error.isEmpty()){fprintf(stderr,"Multi-track clip: %s\n",qPrintable(result.error));return 4;}
+    const auto index=MocapClipIndex::build(options.output);
+    QFile output(options.output);
+    if(!index.error.isEmpty()||index.frames!=result.frames||!output.open(QIODevice::ReadOnly))return 5;
+    const QJsonArray row=index.frameAt(output,10).value("tracks").toArray();
+    if(row.size()!=2||row[0].toObject().value("sensor")!="sensor-1"||
+       row[1].toObject().value("face").toObject().value("blendshapes")
+           .toObject().value("jawOpen").toDouble()!=.2)return 6;
+    options.output=directory.filePath("noise-only.jsonl");options.loopBlend=0;
+    const auto noise=MocapClipProcessor::process(options);
+    if(!noise.error.isEmpty()||noise.frames!=120)return 7;
+    QFile noiseFile(options.output);if(!noiseFile.open(QIODevice::ReadOnly))return 8;
+    const auto noiseIndex=MocapClipIndex::build(options.output);
+    const QJsonArray frame=noiseIndex.frameAt(noiseFile,10).value("tracks").toArray();
+    auto wrist=[](const QJsonValue& track) {
+      return track.toObject().value("bodies").toArray()[0].toObject().value("joints")
+          .toObject().value("wristL").toObject().value("p").toArray()[0].toDouble();
+    };
+    if(frame.size()!=2||std::abs(wrist(frame[0])-(1.5-.02))>1e-5||
+       std::abs(wrist(frame[1])-(3.-.02))<.001)return 9;
+    return 0;
   }
   if (app.arguments().contains("--check-clip-editor")) {
     QTemporaryDir dir;if(!dir.isValid())return 2;
@@ -4393,6 +5057,9 @@ int main(int argc, char** argv) {
     image.save("/tmp/kinect-remold-mocap-window.png");
     return image.width()>=1100&&image.height()>=700?0:2;
   }
+  if (app.arguments().contains("--check-face-fusion")) {
+    MotionCaptureWindow window;return window.checkFaceFusion();
+  }
   if (app.arguments().contains("--check-mocap-guidance")) {
     MotionCaptureWindow window;window.show();app.processEvents();
     const int result=window.checkGuidance();
@@ -4415,9 +5082,7 @@ int main(int argc, char** argv) {
     if(!host.startHost(0,args[index+1],args[index+2],args[index+3])) {
       fprintf(stderr,"LAN host: %s\n",host.error().toUtf8().constData());return 3;
     }
-    QByteArray received,atController;
-    QObject::connect(&client,&LanPoseLink::remotePose,&app,
-                     [&](const QString&,const QByteArray& pose){received=pose;});
+    QByteArray atController;
     QObject::connect(&host,&LanPoseLink::remotePose,&app,
                      [&](const QString&,const QByteArray& pose){atController=pose;});
     QObject::connect(&client,&LanPoseLink::failed,&app,
@@ -4431,21 +5096,21 @@ int main(int argc, char** argv) {
                                                     {"c",.9}}}};
     const QJsonObject body{{"id",1},{"tracked",true},{"joints",joints}};
     const QByteArray pose=QJsonDocument(QJsonObject{{"v",1},{"device","synthetic"},
-        {"space","camera"},{"bodies",QJsonArray{body}}}).toJson();
-    host.broadcastPose(pose);
-    timer.restart();
-    while(timer.elapsed()<3000&&received.isEmpty()) {app.processEvents();QThread::msleep(5);}
+        {"space","camera"},{"tracked",true},{"observed",1},{"bodies",QJsonArray{body}},
+        {"face",QJsonObject{{"tracked",true},{"confidence",.9},
+            {"blendshapes",QJsonObject{{"jawOpen",.4}}}}}}).toJson();
     client.broadcastPose(pose);
     timer.restart();
     while(timer.elapsed()<3000&&atController.isEmpty()) {app.processEvents();QThread::msleep(5);}
-    const QJsonObject remote=QJsonDocument::fromJson(received).object();
     const QJsonObject controller=QJsonDocument::fromJson(atController).object();
-    return remote.value("device").toString().endsWith("/synthetic")&&
-        controller.value("device").toString().endsWith("/synthetic")&&
-        remote.value("seq").toInt()==1&&
-        !remote.value("tMonoNs").toString().isEmpty()&&
-        remote.value("clockUncertaintyNs").toDouble()==1000000000.0&&
-        remote.value("calibrationRevision").toString()=="unconfigured"?0:6;
+    return controller.value("device").toString().endsWith("/synthetic")&&
+        controller.value("seq").toInt()==1&&
+        !controller.value("tMonoNs").toString().isEmpty()&&
+        controller.value("clockUncertaintyNs").toDouble()==1000000000.0&&
+        controller.value("calibrationRevision").toString()=="unconfigured"&&
+        controller.value("bodies").toArray().size()==1&&
+        controller.value("face").toObject().value("blendshapes").toObject()
+            .value("jawOpen").toDouble()==.4?0:6;
   }
   if (app.arguments().contains("--check-websocket")) {
     MocapWebSocket server;
@@ -4530,6 +5195,67 @@ int main(int argc, char** argv) {
     QFile obj(objPath);if(!obj.open(QIODevice::ReadOnly))return 10;
     return obj.readLine().contains("0.86275 0.13725 0.09804")?0:11;
   }
+  if(app.arguments().contains("--check-scanner-pose")) {
+    const DepthIntrinsics camera{160,120,180,180,79.5,59.5,{}};
+    ScannerPose moved;
+    const QQuaternion rotation=QQuaternion::fromEulerAngles(1.0f,2.0f,-1.0f);
+    for(int col=0;col<3;++col) {
+      QVector3D axis(col==0,col==1,col==2);
+      axis=rotation.rotatedVector(axis);
+      for(int row=0;row<3;++row)moved.m[row*4+col]=axis[row];
+    }
+    moved.m[3]=.025f;moved.m[7]=-.012f;moved.m[11]=-.018f;
+    auto render=[&](const ScannerPose& pose) {
+      QByteArray image(camera.width*camera.height*2,0);
+      QImage color(camera.width,camera.height,QImage::Format_RGB32);color.fill(Qt::black);
+      const QVector3D origin=pose.world({0,0,0});
+      const std::array<std::pair<QVector3D,QVector3D>,2> boxes{{
+          {{-.20f,-.16f,.86f},{.16f,.16f,1.16f}},
+          {{.10f,-.10f,1.10f},{.30f,.11f,1.30f}}}};
+      for(int y=0;y<camera.height;++y)for(int x=0;x<camera.width;++x) {
+        double rx=0,ry=0;camera.ray(x,y,rx,ry);
+        const QVector3D direction=pose.world({float(rx),float(ry),1.f})-origin;
+        float nearest=100;
+        for(const auto& box:boxes) {
+          float enter=0,leave=100;
+          for(int axis=0;axis<3;++axis) {
+            if(std::abs(direction[axis])<1e-6f)continue;
+            float a=(box.first[axis]-origin[axis])/direction[axis];
+            float b=(box.second[axis]-origin[axis])/direction[axis];
+            if(a>b)std::swap(a,b);
+            enter=std::max(enter,a);leave=std::min(leave,b);
+          }
+          if(leave>=enter&&enter>0)nearest=std::min(nearest,enter);
+        }
+        if(nearest>=2)continue;
+        const QVector3D surface=origin+direction*nearest;
+        auto channel=[](float value){return std::clamp(int(std::lround(128+100*value)),0,255);};
+        color.setPixel(x,y,qRgb(channel(std::sin(surface.x()*49+surface.y()*17)+
+                                      .3f*std::sin(surface.x()*107)),
+                               channel(std::sin(surface.y()*63-surface.x()*23)+
+                                      .3f*std::cos(surface.y()*91)),
+                               channel(std::cos(surface.x()*33+surface.y()*47))));
+        const quint16 mm=quint16(std::lround(nearest*1000));
+        const int offset=(y*camera.width+x)*2;
+        image[offset]=char(mm&255);image[offset+1]=char(mm>>8);
+      }
+      return std::pair<QByteArray,QImage>{image,color};
+    };
+    const auto reference=render(ScannerPose{}),current=render(moved);
+    const auto visual=ScannerVisualTracker{}.align(current.first,reference.first,camera,
+                                                   current.second,reference.second);
+    const auto depthOnly=ScannerIcp{}.align(current.first,reference.first,camera,nullptr,false);
+    const auto result=ScannerIcp{}.align(current.first,reference.first,camera,nullptr,false,
+                                        visual.accepted?&visual.currentToReference:nullptr);
+    const QVector3D estimate(result.currentToReference.m[3],result.currentToReference.m[7],
+                             result.currentToReference.m[11]);
+    const float error=(estimate-QVector3D(.025f,-.012f,-.018f)).length();
+    fprintf(stderr,"Scanner synthetic pose: visual %d/%d (%.1f mm), depth %d/%d (%.1f mm, observability %.3f), translation error %.1f mm\n",
+        visual.inliers,visual.matches,visual.rmsM*1000,int(result.accepted),result.matches,
+        result.rmsM*1000,result.translationObservability,error*1000);
+    return depthOnly.translationObservability<.02f&&visual.accepted&&
+        result.accepted&&error<.012f?0:2;
+  }
 #ifdef Q_OS_MACOS
   if (app.arguments().contains("--check-body-model")) {
     OnnxBodyTracker tracker(QCoreApplication::applicationDirPath() +
@@ -4595,14 +5321,6 @@ int main(int argc, char** argv) {
   }
 #endif
   MainWindow window;
-  if (app.arguments().contains("--check-audio")) {
-    MicrophoneWindow microphones;
-    return microphones.checkLiveAudio();
-  }
-  if (app.arguments().contains("--check-acoustic")) {
-    AcousticWindow acoustic;
-    return acoustic.checkLiveScan();
-  }
   if (app.arguments().contains("--check-surveillance")) {
     SurveillanceWindow surveillance;
     return surveillance.checkLiveCameras();

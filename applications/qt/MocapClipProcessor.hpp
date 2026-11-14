@@ -2,6 +2,7 @@
 #include <QFile>
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 #include <vector>
 
 struct MocapClipOptions {
@@ -10,6 +11,9 @@ struct MocapClipOptions {
   double trimStart=0,trimEnd=0,faceOffset=0,loopBlend=0;
   int smoothing=0;
   bool inPlaceLoop=true;
+  QStringList selectedTracks;
+  bool splitTracks=true;
+  int forcedSeamStart=-1,forcedSeamEnd=-1;
 };
 
 struct MocapClipResult {
