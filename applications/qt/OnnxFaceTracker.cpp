@@ -336,8 +336,9 @@ QJsonObject OnnxFaceTracker::track(const QImage& image,
       yawDegrees=float(std::atan2(forward.x(),forward.z())*57.2957795);
     }
     const float rollDegrees=measuredRoll*57.2957795f;
-    const bool unusable=!head.contains("q")||confidence<.65f||cropOccupancy>.9f||
-        std::abs(yawDegrees)>50.f||std::abs(rollDegrees)>45.f;
+    // A profile view can still supply useful expressions to another camera's
+    // solve. Report its angle as marginal quality rather than discarding it.
+    const bool unusable=!head.contains("q")||confidence<.65f||cropOccupancy>.9f;
     const bool marginal=!unusable&&(confidence<.85f||cropOccupancy>.72f||
         std::abs(yawDegrees)>32.f||std::abs(rollDegrees)>28.f);
     const QString reason=cropOccupancy>.72f?"adjust-face-distance":

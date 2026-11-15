@@ -1676,7 +1676,9 @@ class MocapStageView : public QWidget {
   explicit MocapStageView(QWidget* parent=nullptr):QWidget(parent) {
     setMinimumSize(640,420);
   }
-  void setFrame(const QImage& image) {frame_=image;update();}
+  void setFrame(const QImage& image,const QString& sensor={}) {
+    frame_=image;frameSensor_=sensor;update();
+  }
   void setPose(const QByteArray& json) {pose_=QJsonDocument::fromJson(json).object();update();}
   void setView(View view) {view_=view;update();}
   void setFaceSurface(bool enabled) {faceSurface_=enabled;update();}
@@ -1755,7 +1757,7 @@ class MocapStageView : public QWidget {
     const QJsonObject face=pose_.value("face").toObject();
     if(!face.value("tracked").toBool())return;
     const QString faceSensor=face.value("sourceSensor").toString();
-    if(!faceSensor.isEmpty()&&faceSensor!=pose_.value("device").toString())return;
+    if(!faceSensor.isEmpty()&&faceSensor!=frameSensor_)return;
     const bool marginal=face.value("quality").toObject().value("state")=="yellow";
     const QJsonArray points=face.value("landmarks").toArray();
     if(points.size()!=478)return;
@@ -1807,7 +1809,8 @@ class MocapStageView : public QWidget {
                           fitted.width(),fitted.height());
       p.drawImage(target,frame_);
       drawFaceSurface(p,target);
-      drawBones(p,joints(pose_),[target](const QJsonObject& joint){return imagePoint(joint,target);});
+      if(frameSensor_.isEmpty()||frameSensor_==pose_.value("device").toString())
+        drawBones(p,joints(pose_),[target](const QJsonObject& joint){return imagePoint(joint,target);});
     }
     p.setPen(QColor(230,239,247));p.drawText(area.adjusted(12,10,-10,-10),Qt::AlignTop,"VIDEO + 3D JOINTS");
     p.restore();
@@ -1846,7 +1849,7 @@ class MocapStageView : public QWidget {
         tracks.isEmpty()?"3D STAGE · DRAG TO ORBIT":"3D STAGE · ALIGNED PEOPLE · DRAG TO ORBIT");
     p.restore();
   }
-  QImage frame_;QJsonObject pose_;View view_=View::Split;bool faceSurface_=true;
+  QImage frame_;QString frameSensor_;QJsonObject pose_;View view_=View::Split;bool faceSurface_=true;
   QPoint lastMouse_;float yaw_=-.3f,pitch_=-.2f;
 };
 
@@ -1911,7 +1914,10 @@ class MocapPoseSmoother {
     QJsonObject face=root.value("face").toObject();
     if(face.value("tracked").toBool()) {
       const double dt=time-faceTime_;
-      if(!face_.isEmpty()&&dt>.001&&dt<.25) {
+      // Landmarks and head rotation are in the source camera's coordinates.
+      // A fusion source switch must start a new smoothing history.
+      if(!face_.isEmpty()&&dt>.001&&dt<.25&&
+         face.value("sourceSensor")==face_.value("sourceSensor")) {
         const QJsonArray current=face.value("landmarks").toArray();
         const QJsonArray previous=face_.value("landmarks").toArray();
         if(current.size()==478&&previous.size()==478) {
@@ -2399,7 +2405,7 @@ class MotionCaptureWindow : public QMainWindow {
       if(selectedSensor_=="local") {
         if(!history_.empty())showTimeline(timeline_->value());
       } else {
-        stage_->setFrame(localFrames_.value(selectedSensor_));
+        stage_->setFrame(localFrames_.value(selectedSensor_),selectedSensor_);
         stage_->setPose(localPoses_.contains(selectedSensor_)?
             localPoses_.value(selectedSensor_):remotePoses_.value(selectedSensor_));
       }
@@ -2417,9 +2423,52 @@ class MotionCaptureWindow : public QMainWindow {
         {"blendshapes",QJsonObject{{"jawOpen",.8}}}};
     const QJsonObject fused=combineFaces({{"sensor-a",a},{"sensor-b",b}});
     const double jaw=fused.value("blendshapes").toObject().value("jawOpen").toDouble();
+    const QJsonObject profile{{"tracked",true},{"confidence",.98},{"landmarks",left},
+        {"quality",QJsonObject{{"yawDegrees",40.}}},
+        {"blendshapes",QJsonObject{{"jawOpen",.9}}}};
+    const QJsonObject frontal{{"tracked",true},{"confidence",.82},{"landmarks",right},
+        {"quality",QJsonObject{{"yawDegrees",5.}}},
+        {"blendshapes",QJsonObject{{"jawOpen",.2}}}};
+    const QJsonObject turned=combineFaces({{"profile",profile},{"frontal",frontal}});
+    const double turnedJaw=turned.value("blendshapes").toObject().value("jawOpen").toDouble();
+    auto view=[&](double yaw,const QString& state,const QString& reason) {
+      return QJsonObject{{"tracked",true},{"confidence",.97},
+          {"blendshapes",QJsonObject{{"jawOpen",.3}}},
+          {"quality",QJsonObject{{"state",state},{"reason",reason},
+              {"yawDegrees",yaw},{"rollDegrees",5.}}}};
+    };
+    const QJsonObject complementary=combineFaces({
+        {"sensor-a",view(-37.,"yellow","turn-toward-camera")},
+        {"sensor-b",view(39.,"yellow","turn-toward-camera")}});
+    const QJsonObject sameSide=combineFaces({
+        {"sensor-a",view(37.,"yellow","turn-toward-camera")},
+        {"sensor-b",view(39.,"yellow","turn-toward-camera")}});
+    const QJsonObject oneClear=combineFaces({
+        {"sensor-a",view(37.,"yellow","turn-toward-camera")},
+        {"sensor-b",view(12.,"green","face-visible")}});
+    MocapPoseSmoother smoother;
+    QJsonArray oldMesh,newMesh;
+    for(int i=0;i<478;++i) {
+      oldMesh.append(QJsonArray{.1,.1,0.});
+      newMesh.append(QJsonArray{.9,.9,0.});
+    }
+    smoother.filter(QJsonObject{{"device","primary"},{"t",1.},
+        {"face",QJsonObject{{"tracked",true},{"sourceSensor","sensor-a"},
+            {"landmarks",oldMesh}}}});
+    const QJsonObject switched=smoother.filter(QJsonObject{{"device","primary"},{"t",1.03},
+        {"face",QJsonObject{{"tracked",true},{"sourceSensor","sensor-b"},
+            {"landmarks",newMesh}}}}).value("face").toObject();
     return fused.value("sources").toArray().size()==2&&
         fused.value("sourceSensor")=="sensor-a"&&
-        fused.value("landmarks").toArray()==left&&jaw>.4&&jaw<.5?0:2;
+        fused.value("landmarks").toArray()==left&&jaw>.4&&jaw<.5&&
+        turned.value("sourceSensor")=="frontal"&&
+        turned.value("landmarks").toArray()==right&&
+        turned.value("sources").toArray().size()==2&&turnedJaw>.2&&turnedJaw<.4&&
+        complementary.value("quality").toObject().value("state")=="green"&&
+        complementary.value("quality").toObject().value("reason")=="fused-complementary-views"&&
+        sameSide.value("quality").toObject().value("state")=="yellow"&&
+        oneClear.value("quality").toObject().value("state")=="green"&&
+        switched.value("landmarks").toArray()==newMesh?0:2;
   }
   int checkAudioWav() {
     QTemporaryDir directory;
@@ -2750,14 +2799,27 @@ class MotionCaptureWindow : public QMainWindow {
     status_->setText(QString("Measured placement set for %1 sensor(s)").arg(fields.size()));
   }
   static QJsonObject combineFaces(const std::vector<std::pair<QString,QJsonObject>>& views) {
-    double bestConfidence=0;
+    auto viewWeight=[](const QJsonObject& face) {
+      if(!face.value("tracked").toBool())return 0.;
+      const double confidence=face.value("confidence").toDouble();
+      if(confidence<.55)return 0.;
+      const QJsonObject quality=face.value("quality").toObject();
+      const double yaw=std::abs(quality.value("yawDegrees").toDouble());
+      const double roll=std::abs(quality.value("rollDegrees").toDouble());
+      // A face seen nearly head-on gives more reliable expression and mesh
+      // measurements than a profile, even when model presence is higher.
+      const double frontal=std::clamp(1.-yaw/65.,.15,1.);
+      const double upright=std::clamp(1.-roll/90.,.5,1.);
+      return confidence*confidence*frontal*frontal*upright;
+    };
+    double bestWeight=0;
     QJsonObject best;
     QString bestSensor;
     for(const auto& view:views) {
       const QJsonObject face=view.second;
-      const double confidence=face.value("confidence").toDouble();
-      if(face.value("tracked").toBool()&&confidence>bestConfidence) {
-        best=face;bestSensor=view.first;bestConfidence=confidence;
+      const double weight=viewWeight(face);
+      if(weight>bestWeight) {
+        best=face;bestSensor=view.first;bestWeight=weight;
       }
     }
     if(best.isEmpty())return {};
@@ -2765,12 +2827,10 @@ class MotionCaptureWindow : public QMainWindow {
     QJsonArray sources;
     for(const auto& view:views) {
       const QJsonObject face=view.second;
-      const double confidence=face.value("confidence").toDouble();
-      if(!face.value("tracked").toBool()||confidence<.55||
-         confidence<bestConfidence*.75)continue;
+      const double weight=viewWeight(face);
+      if(weight<=0)continue;
       const QJsonObject shapes=face.value("blendshapes").toObject();
       if(shapes.isEmpty())continue;
-      const double weight=confidence*confidence;
       for(auto it=shapes.begin();it!=shapes.end();++it)if(it.value().isDouble()) {
         sums[it.key()]=sums.value(it.key()).toDouble()+weight*it.value().toDouble();
         weights[it.key()]=weights.value(it.key()).toDouble()+weight;
@@ -2785,6 +2845,28 @@ class MotionCaptureWindow : public QMainWindow {
     best["sourceSensor"]=bestSensor;
     best["sources"]=sources;
     best["fusion"]=sources.size()>1?"weighted-expressions+best-mesh":"best-view";
+    QJsonObject quality=best.value("quality").toObject();
+    quality["sourceState"]=quality.value("state");
+    quality["sourceReason"]=quality.value("reason");
+    bool clearView=false;
+    bool leftProfile=false,rightProfile=false;
+    for(const auto& view:views) {
+      const QJsonObject face=view.second;
+      if(viewWeight(face)<=0||face.value("blendshapes").toObject().isEmpty())continue;
+      const QJsonObject viewQuality=face.value("quality").toObject();
+      clearView|=viewQuality.value("state")=="green";
+      if(face.value("confidence").toDouble()<.85||
+         viewQuality.value("reason")!="turn-toward-camera"||
+         std::abs(viewQuality.value("rollDegrees").toDouble())>28.)continue;
+      const double yaw=viewQuality.value("yawDegrees").toDouble();
+      if(yaw>=-50.&&yaw<=-32.)leftProfile=true;
+      if(yaw>=32.&&yaw<=50.)rightProfile=true;
+    }
+    if(sources.size()>1&&(clearView||(leftProfile&&rightProfile))) {
+      quality["state"]="green";
+      quality["reason"]=clearView?"fused-clear-view":"fused-complementary-views";
+    }
+    best["quality"]=quality;
     return best;
   }
   QJsonObject fuseLocalPose(QJsonObject primary) const {
@@ -2977,7 +3059,13 @@ class MotionCaptureWindow : public QMainWindow {
       worker_=new StreamWorker(d,bodyOn?5u:1u,bodyOn?(faceOn?5:7):6,this);
       connect(worker_,&StreamWorker::frameReady,this,[this](const QImage& image){
         lastFrame_=image;
-        if(selectedSensor_=="local")stage_->setFrame(image);
+        if(selectedSensor_=="local") {
+          const QString faceSensor=history_.empty()?QString():
+              QJsonDocument::fromJson(history_.back()).object().value("face").toObject()
+                  .value("sourceSensor").toString();
+          if(activeCaptureMode_!=1||faceSensor.isEmpty()||faceSensor==activePrimarySensor_)
+            stage_->setFrame(image,activePrimarySensor_);
+        }
       });
     }
     processPose_=[this](const QByteArray& rawPose){
@@ -3295,7 +3383,12 @@ class MotionCaptureWindow : public QMainWindow {
               "Starting face");
       connect(observer,&StreamWorker::frameReady,this,[this,sensor](const QImage& image){
         localFrames_[sensor]=image;
-        if(selectedSensor_==sensor)stage_->setFrame(image);
+        if(selectedSensor_==sensor)stage_->setFrame(image,sensor);
+        else if(selectedSensor_=="local"&&activeCaptureMode_==1&&!history_.empty()) {
+          const QJsonObject latest=QJsonDocument::fromJson(history_.back()).object();
+          if(latest.value("face").toObject().value("sourceSensor")==sensor)
+            stage_->setFrame(image,sensor);
+        }
       });
       connect(observer,&StreamWorker::poseReady,this,[this,sensor](const QByteArray& pose){
         lan_.broadcastPose(pose);
@@ -3570,7 +3663,11 @@ class MotionCaptureWindow : public QMainWindow {
       const QString color=!found?"#a5232e":marginal?"#aa7900":"#138144";
       quality_->setText(!found?"FACE LOST":marginal?"FACE MARGINAL":"FACE GOOD");
       const QString reason=faceQuality.value("reason").toString();
-      qualityDetail_->setText(reason=="turn-toward-camera"?
+      qualityDetail_->setText(reason=="fused-clear-view"?
+          "Face clear in at least one sensor view":
+          reason=="fused-complementary-views"?
+          "Both sensor views support this head rotation":
+          reason=="turn-toward-camera"?
           "Turn more toward the camera for reliable expressions":
           reason=="adjust-face-distance"?
           "Face fills tracking crop; step back if close and hold steady":
@@ -3656,7 +3753,15 @@ class MotionCaptureWindow : public QMainWindow {
     }
     if(index<0||index>=int(history_.size()))return;
     timeline_->setValue(index);
-    if(selectedSensor_=="local") {stage_->setFrame(lastFrame_);stage_->setPose(history_[size_t(index)]);}
+    if(selectedSensor_=="local") {
+      const QJsonObject pose=QJsonDocument::fromJson(history_[size_t(index)]).object();
+      const QString faceSensor=pose.value("face").toObject().value("sourceSensor").toString();
+      if(activeCaptureMode_==1&&faceSensor!=activePrimarySensor_&&
+         !localFrames_.value(faceSensor).isNull())
+        stage_->setFrame(localFrames_.value(faceSensor),faceSensor);
+      else stage_->setFrame(lastFrame_,activePrimarySensor_);
+      stage_->setPose(history_[size_t(index)]);
+    }
     const QJsonObject root=QJsonDocument::fromJson(history_[size_t(index)]).object();
     const double newest=QJsonDocument::fromJson(history_.back()).object().value("t").toDouble();
     const double age=std::max(0.,newest-root.value("t").toDouble());
