@@ -7,3 +7,6 @@
 
 # Local IDE state
 /.idea/
+
+# Local CMake/CLion builds
+/cmake-build-*/

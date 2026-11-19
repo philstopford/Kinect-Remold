@@ -58,6 +58,14 @@ if(APPLE AND TARGET kinect-remold-native-usb)
       "$<TARGET_FILE:kinect-remold-native-usb>"
       "$<TARGET_FILE_DIR:KinectRemoldQt>/kinect-remold-native-usb")
 endif()
+# Direct root/IDE builds need the same private USB helper as portable builds.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET kinect-one-remold)
+  add_dependencies(KinectRemoldQt kinect-one-remold)
+  add_custom_command(TARGET KinectRemoldQt POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "$<TARGET_FILE:kinect-one-remold>"
+      "$<TARGET_FILE_DIR:KinectRemoldQt>/kinect-one-remold")
+endif()
 if(REMOLD_MODEL_DIR AND EXISTS "${REMOLD_MODEL_DIR}/movenet.onnx")
   if(APPLE)
     set(_remold_staged_models "$<TARGET_FILE_DIR:KinectRemoldQt>/../Resources/models")
@@ -66,17 +74,17 @@ if(REMOLD_MODEL_DIR AND EXISTS "${REMOLD_MODEL_DIR}/movenet.onnx")
   endif()
   add_custom_command(TARGET KinectRemoldQt POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${_remold_staged_models}")
-  foreach(_remold_model movenet.onnx rtmpose-hand.onnx face-landmarks.onnx)
+  foreach(_remold_model movenet.onnx rtmpose-hand.onnx face-landmarks.onnx face-blendshapes.onnx)
     if(EXISTS "${REMOLD_MODEL_DIR}/${_remold_model}")
       add_custom_command(TARGET KinectRemoldQt POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${REMOLD_MODEL_DIR}/${_remold_model}" "${_remold_staged_models}/${_remold_model}")
     endif()
   endforeach()
-  if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/models/face-blendshapes.onnx")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/models/face-blendshapes.onnx")
     add_custom_command(TARGET KinectRemoldQt POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/third_party/models/face-blendshapes.onnx"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/models/face-blendshapes.onnx"
         "${_remold_staged_models}/face-blendshapes.onnx")
   endif()
 endif()

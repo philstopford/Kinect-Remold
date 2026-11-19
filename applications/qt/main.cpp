@@ -2432,6 +2432,39 @@ class MotionCaptureWindow : public QMainWindow {
   }
   ~MotionCaptureWindow() override {stop();lan_.stop();if(editorThread_)editorThread_->wait();
     if(indexThread_)indexThread_->wait();}
+  int checkBodyFusion() {
+    activeCaptureMode_=1;activeBody_=true;
+    QJsonObject joints;
+    auto add=[&](const char* name,double x,double y) {
+      joints[name]=QJsonObject{{"p",QJsonArray{x,y,2.}},
+          {"uv",QJsonArray{.5+x*.3,.5-y*.3}},{"c",.8}};
+    };
+    add("shoulderL",-.2,.5);add("shoulderR",.2,.5);
+    add("hipL",-.15,0);add("hipR",.15,0);
+    add("elbowL",-.35,.25);add("elbowR",.35,.25);
+    add("wristL",-.4,0);add("wristR",.4,0);
+    add("kneeL",-.15,-.4);add("kneeR",.15,-.4);
+    add("ankleL",-.15,-.8);add("ankleR",.15,-.8);
+    auto pose=[](const QString& device,const QJsonObject& js) {
+      return QJsonObject{{"device",device},{"tracked",true},
+          {"bodies",QJsonArray{QJsonObject{{"id",1},{"joints",js}}}}};
+    };
+    QJsonObject secondary=joints;
+    QJsonObject wrist=secondary["wristL"].toObject();
+    wrist["p"]=QJsonArray{-.3,0.,2.};secondary["wristL"]=wrist;
+    localPoses_["secondary"]=QJsonDocument(pose("secondary",secondary)).toJson();
+    localPoseTimes_["secondary"]=QDateTime::currentMSecsSinceEpoch();
+    const auto blended=fuseLocalPose(pose("primary",joints));
+    const auto blendedJoints=blended["bodies"].toArray()[0].toObject()["joints"].toObject();
+    const double x=blendedJoints["wristL"].toObject()["p"].toArray()[0].toDouble();
+    if(std::abs(x+.35)>.001||blendedJoints["wristL"].toObject()["uv"]!=joints["wristL"].toObject()["uv"])return 2;
+    for(const char* name:{"wristL","wristR","ankleL","ankleR"})joints.remove(name);
+    const auto recovered=fuseLocalPose(pose("primary",joints));
+    if(updateCaptureQuality(recovered)["state"]!="green")return 3;
+    localPoseTimes_["secondary"]-=1000;
+    if(updateCaptureQuality(fuseLocalPose(pose("primary",joints)))["state"]!="red")return 4;
+    return 0;
+  }
   int checkFaceFusion() const {
     QJsonArray left{QJsonArray{.2,.3,0.}},right{QJsonArray{.7,.3,0.}};
     const QJsonObject a{{"tracked",true},{"confidence",.9},{"landmarks",left},
@@ -2560,9 +2593,9 @@ class MotionCaptureWindow : public QMainWindow {
       fprintf(stderr,"Observer %s: max %d joints\n",qPrintable(it.key()),it.value());
     for(auto it=observerErrors_.cbegin();it!=observerErrors_.cend();++it)
       fprintf(stderr,"Observer %s status: %s\n",qPrintable(it.key()),qPrintable(it.value()));
-    fprintf(stderr,"Fusion gates: missing primary torso %d, stale secondary %d, missing secondary torso %d, torso mismatch %d, joint distance rejected %d, lower-confidence joints %d, accepted joints %d\n",
+    fprintf(stderr,"Fusion gates: missing primary torso %d, stale secondary %d, missing secondary torso %d, torso mismatch %d, joint distance rejected %d, accepted joints %d\n",
         fusionAudit_.primaryTorso,fusionAudit_.stale,fusionAudit_.secondaryTorso,
-        fusionAudit_.torsoMismatch,fusionAudit_.jointDistance,fusionAudit_.confidence,fusionAudit_.accepted);
+        fusionAudit_.torsoMismatch,fusionAudit_.jointDistance,fusionAudit_.accepted);
     stop();
     return processed-initial>=10&&combined>=5?0:4;
   }
@@ -3026,10 +3059,22 @@ class MotionCaptureWindow : public QMainWindow {
         QVector3D existing;
         const bool hasExisting=point(joints,joint.key().toUtf8().constData(),existing);
         if(hasExisting&&(mapped-existing).length()>.25f){++fusionAudit_.jointDistance;continue;}
-        if(hasExisting&&joints.value(joint.key()).toObject().value("c").toDouble()>=confidence){++fusionAudit_.confidence;continue;}
-        QJsonObject fused=candidate;
-        fused["p"]=QJsonArray{mapped.x(),mapped.y(),mapped.z()};
-        fused.remove("uv");
+        // Blend agreeing measurements instead of switching cameras whenever
+        // their confidence ordering changes. Keep image coordinates tied to
+        // their camera; secondary UVs are not primary-preview coordinates.
+        QJsonObject fused=hasExisting?joints.value(joint.key()).toObject():candidate;
+        QVector3D positionInPrimary=mapped;
+        if(hasExisting) {
+          const double primaryConfidence=fused.value("c").toDouble();
+          const double weight=confidence/(primaryConfidence+confidence);
+          positionInPrimary=existing*(1.f-float(weight))+mapped*float(weight);
+          fused["c"]=std::max(primaryConfidence,confidence);
+        } else {
+          fused.remove("uv");
+          fused["observationUv"]=candidate.value("uv");
+          fused["observationSensor"]=it.key();
+        }
+        fused["p"]=QJsonArray{positionInPrimary.x(),positionInPrimary.y(),positionInPrimary.z()};
         joints[joint.key()]=fused;
         ++accepted;
         ++fusionAudit_.accepted;
@@ -3761,14 +3806,20 @@ class MotionCaptureWindow : public QMainWindow {
     int missing=0;double weakest=1.,margin=1.;QString firstMissing;
     for(const char* name:needed) {
       const QJsonObject joint=joints.value(QLatin1String(name)).toObject();
-      const QJsonArray uv=joint.value("uv").toArray();
-      if(uv.size()!=2||joint.value("c").toDouble()<.15) {
+      const QJsonArray position=joint.value("p").toArray();
+      // A joint recovered from another camera has no primary-camera UV.
+      // Judge its 3D observation and use its own camera only for framing.
+      const QJsonArray uv=joint.value(joint.contains("uv")?"uv":"observationUv").toArray();
+      if(position.size()!=3||!std::isfinite(position[0].toDouble())||
+         !std::isfinite(position[1].toDouble())||!std::isfinite(position[2].toDouble())||
+         joint.value("c").toDouble()<.15) {
         ++missing;if(firstMissing.isEmpty())firstMissing=QLatin1String(name);
         continue;
       }
       weakest=std::min(weakest,joint.value("c").toDouble());
-      margin=std::min({margin,uv[0].toDouble(),1.-uv[0].toDouble(),
-                      uv[1].toDouble(),1.-uv[1].toDouble()});
+      if(uv.size()==2)
+        margin=std::min({margin,uv[0].toDouble(),1.-uv[0].toDouble(),
+                        uv[1].toDouble(),1.-uv[1].toDouble()});
     }
     int badLinks=0;
     auto distance=[&](const char* parent,const char* child) {
@@ -4198,7 +4249,7 @@ class MotionCaptureWindow : public QMainWindow {
   QHash<QString,QString> observerErrors_;
   QHash<QString,RoomTransform> roomTransforms_;
   struct FusionAudit {int primaryTorso=0,stale=0,secondaryTorso=0,torsoMismatch=0,
-      jointDistance=0,confidence=0,accepted=0;};
+      jointDistance=0,accepted=0;};
   mutable FusionAudit fusionAudit_;
   QString roomReferenceSensor_;
   QByteArray latestPrimaryPose_;
@@ -5245,6 +5296,9 @@ int main(int argc, char** argv) {
     const QImage image=window.grab().toImage();
     image.save("/tmp/kinect-remold-mocap-window.png");
     return image.width()>=1100&&image.height()>=700?0:2;
+  }
+  if (app.arguments().contains("--check-body-fusion")) {
+    MotionCaptureWindow window;return window.checkBodyFusion();
   }
   if (app.arguments().contains("--check-face-fusion")) {
     MotionCaptureWindow window;return window.checkFaceFusion();

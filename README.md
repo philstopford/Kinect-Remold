@@ -27,6 +27,9 @@ Kinect Remold provides native runtimes and SynKinect Studio for first-generation
 
 For first-generation Xbox 360 Kinects, Windows 11 can expose a Media Foundation virtual camera per device; Windows 10 build 19041 or newer uses the loopback-only local MJPEG image backend instead. The Kinect One/v2 runtime currently publishes its imaging transport to the Remold SDK/Studio and does not advertise an operating-system virtual camera. Generation-specific support is isolated into driver modules. The Xbox 360 module provides tilt, LED and four-microphone-array integration; the Xbox One module provides its native imaging transport and calibration capabilities.
 
+For a GUI with breakpoints and mocap timing diagnostics, see
+[Debug GUI in CLion](docs/QT-DEVELOPER-GUIDE.md#debug-gui-in-clion).
+
 ### Driver modules
 
 Source drivers live under `drivers/modules/<module-id>/`. Each module owns native transports, installation, runtime services and its public discovery endpoint. Device rows include a stable `module-id` and `generation`, so SynKinect Studio can route multiple generations concurrently without assuming one transport implementation.

@@ -7,6 +7,48 @@ reference for workflow and features, not proof of Qt parity. The
 [workspace note](QT-MOCAP-WORKSPACE.md) contains detailed control and output
 behavior.
 
+## Debug GUI in CLion
+
+Open the repository root as a CMake project. Select the **KinectRemoldQt**
+run configuration and the **Debug** CMake profile, then click **Debug**
+(the bug icon). If the target is missing, use **Tools → CMake → Reload CMake
+Project**. The shared configuration enables mocap timing output in the debugger
+console; normal GUI controls start tracking. Stop tracking in other instances
+before opening the same sensors.
+
+If debugging starts without a window, check the selected run configuration.
+`kinect-one-remold` is the USB runtime service and has no GUI. Stop that
+session, select **KinectRemoldQt** in the Run/Debug dropdown, and click
+**Debug** again. Building the Debug profile alone does not open a window.
+
+The root build stages the Linux USB helper next to the executable, so the GUI
+starts and stops its own runtime automatically. Linux still needs the USB
+permissions described in [the quickstart](LINUX-QT-QUICKSTART.md). macOS keeps
+its existing native helper staging; Windows uses its installed runtime service.
+
+Install Qt 6 development libraries, ONNX Runtime development files, CMake, a
+C++ compiler and debugger; Linux also needs pkg-config and libusb. On Arch,
+`onnxruntime-cpu` provides the ONNX dependency. No Python ONNX package is needed.
+Models must already have been downloaded and verified by the platform build
+script. Root CMake discovers `binaries/model-cache` or the packaged Linux/Windows
+model directory; use `-DREMOLD_MODEL_DIR=/absolute/path/to/models` to override it.
+
+Equivalent terminal commands (no Ninja dependency):
+
+```sh
+cmake -S . -B cmake-build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build cmake-build-debug --target KinectRemoldQt --parallel 4
+# Linux:
+REMOLD_PROFILE_MOCAP=1 gdb --args cmake-build-debug/applications/qt/KinectRemoldQt
+# At the GDB prompt: run
+```
+
+Debug builds include symbols and disable compiler optimization, which can slow
+capture and solving. For timing comparisons with normal operation, use a
+separate build directory with `-DCMAKE_BUILD_TYPE=RelWithDebInfo`; it retains
+symbols with optimization, though some variables may be unavailable to the
+debugger. Enabling debugging does not resolve full-body fusion instability.
+
 ## Code and data flow
 
 ```text
