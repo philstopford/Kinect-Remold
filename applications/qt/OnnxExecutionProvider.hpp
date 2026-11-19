@@ -23,7 +23,20 @@ inline std::unique_ptr<Ort::Session> createOnnxSession(Ort::Env& env,
   auto make=[&](bool accelerated) {
     Ort::SessionOptions options;
     options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    if(intraOpThreads>0)options.SetIntraOpNumThreads(intraOpThreads);
+    int threads=intraOpThreads;
+#if defined(__linux__) || defined(_WIN32)
+    // Body and hand sessions run concurrently for every sensor. Giving each
+    // its own machine-sized pool oversubscribes the host as sensors are added.
+    // Keep explicitly tuned face sessions and the macOS provider path intact.
+    if(threads==0) {
+      bool valid=false;
+      const int configured=qEnvironmentVariableIntValue("REMOLD_ONNX_THREADS",&valid);
+      threads=valid&&configured>=1&&configured<=16?configured:2;
+      options.AddConfigEntry("session.intra_op.allow_spinning","0");
+      options.AddConfigEntry("session.inter_op.allow_spinning","0");
+    }
+#endif
+    if(threads>0)options.SetIntraOpNumThreads(threads);
     if(accelerated) {
       if(provider=="CUDAExecutionProvider") {
         OrtCUDAProviderOptions cuda{};

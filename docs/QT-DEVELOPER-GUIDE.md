@@ -72,6 +72,14 @@ for RTMPose Hand. CPU remains the portable default; setting
 that system. Depth registration bins projected points in
 color-image space before searching for each joint.
 
+On Linux/Windows, body/hand sessions that previously requested automatic thread
+counts now default to two intra-op threads with spinning disabled. Set
+`REMOLD_ONNX_THREADS=1..16` before startup to override that default. Explicit
+face-session thread counts and the macOS defaults are preserved. Body/hand
+capture drains superseded buffered RGB packets while retaining ordered depth;
+the packet scanner requires a complete newer RGB frame before skipping work.
+See [the measurements](QT-MULTI-PERSON-MOCAP.md#cpu-use-during-body-fusion).
+
 Motion Capture exposes Body, Hands and Face provider selectors, an articulated-fit
 switch, and a live timing readout. Applying a provider recreates the ONNX
 sessions and restarts tracking; recordings must be stopped first. Stability

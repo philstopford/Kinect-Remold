@@ -307,6 +307,9 @@ observations through shoulder/hip alignment and combines facial expressions
 from confident views. Both cameras must see the same person's shoulders and
 hips; this is observation-level fusion, without hardware synchronization or
 measured multi-camera triangulation. See [multi-sensor motion capture](docs/QT-MULTI-PERSON-MOCAP.md).
+Linux/Windows body and hand inference uses bounded per-session thread pools,
+and body capture skips superseded buffered RGB frames to limit backlog. See the
+[CPU measurements and tuning notes](docs/QT-MULTI-PERSON-MOCAP.md#cpu-use-during-body-fusion).
 The latest camera Start action takes ownership of that sensor across Qt windows.
 Motion Capture defaults to a large video overlay and shows a green, yellow, or
 red local-fit marker with framing and joint-quality guidance. Body joints are

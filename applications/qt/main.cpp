@@ -76,6 +76,7 @@
 #include "MotionDetector.hpp"
 #include "MjpegAviWriter.hpp"
 #include "DeploymentHelp.hpp"
+#include "FrameQueue.hpp"
 #ifdef Q_OS_LINUX
 #include "PortableLinuxRuntime.hpp"
 #endif
@@ -561,6 +562,16 @@ protected:
       // Retain metric depth for export while the landmark preview stays RGB.
       if (overlay_ > 0 && overlay_ != 4 && device_.generation == QStringLiteral("xbox-one") &&
           format != KinectOneRemoldProtocol::Jpeg) continue;
+#ifndef Q_OS_MACOS
+      if((overlay_==5||overlay_==7)&&
+         (format==KinectOneRemoldProtocol::Jpeg||format==4||format==0x41524742u)) {
+        // Inference can be slower than acquisition. Keep draining depth and
+        // skip superseded RGB frames instead of accumulating capture latency.
+        socket.waitForReadyRead(0);
+        if(remold::hasQueuedRgbFrame(socket.peek(std::min<qint64>(socket.bytesAvailable(),
+                                               32ll*1024*1024))))continue;
+      }
+#endif
       QImage image = decode(payload, width, height, format);
       if(!image.isNull()&&(format==KinectOneRemoldProtocol::Jpeg||
                             format==4||format==0x41524742u))emit rgbReady(image,frameTick);

@@ -78,3 +78,36 @@ views produced too few usable body observations to pass. The measured result
 confirms execution of the shared fusion path on Linux, not continuous two-view
 contributions or calibrated motion accuracy. The solver retains stronger
 existing joints instead of forcing an average of both cameras.
+
+### CPU use during body fusion
+
+Linux and Windows now use two inference threads per body/hand model session,
+instead of allowing every sensor's sessions to allocate machine-sized thread
+pools. Their worker pools also stop spinning while waiting. The face model's
+explicit thread settings and expression-fusion algorithm are unchanged, as are
+the existing macOS inference settings. Restart the application to use the new
+settings; stopping and starting tracking in an already running older executable
+does not update that executable.
+
+The body/hands stream also skips a superseded RGB frame when a complete newer
+RGB packet is already buffered. It still reads depth packets in sequence, and
+never drops the last complete RGB frame merely because a newer packet is
+partial. This prevents processing all buffered video after an inference delay.
+Face-only capture and the macOS frame-consumption path retain their behavior.
+
+On this 16-thread Linux host, a repeated two-camera synthetic inference workload
+(20 total camera frames, each with body and two hand inferences) changed from
+1.24 seconds elapsed / 17.4 CPU seconds to 0.75 seconds elapsed / 2.48 CPU seconds.
+These figures exclude facial inference and USB decoding. A subsequent warmed
+30-second live check passed with 170 output poses, 41 poses receiving body joints
+from both cameras, and 563 accepted secondary joints. The GUI process averaged
+4.1 CPU cores during that run; the separate USB runtime is additional. Framing
+varied between live runs, so the joint counts are not an accuracy comparison.
+
+To try a smaller or larger body/hand inference budget on Linux/Windows, set
+`REMOLD_ONNX_THREADS` to an integer from 1 to 16 before launching; the default is
+2 per session, not a global process CPU limit. This setting does not override
+the face model's explicit two-thread configuration. `REMOLD_PROFILE_MOCAP=1`
+prints body/hand/face/lifting timings; the GUI's Timing option shows them too.
+CPU tuning does not remove the need for usable depth and visible torso joints
+in both views, and does not add hardware capture synchronization.
