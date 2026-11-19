@@ -75,6 +75,10 @@
 #include "KinectOneRemoldProtocol.h"
 #include "MotionDetector.hpp"
 #include "MjpegAviWriter.hpp"
+#include "DeploymentHelp.hpp"
+#ifdef Q_OS_LINUX
+#include "PortableLinuxRuntime.hpp"
+#endif
 #include "DepthCalibration.hpp"
 #include "TsdfVolume.hpp"
 #include "ScannerIcp.hpp"
@@ -122,6 +126,8 @@ QString sdkPath(bool one) {
       : QString::fromLocal8Bit(configured);
   return root + QStringLiteral("/sdk.sock");
 #else
+  const QByteArray configured=qgetenv(one?"REMOLD_LINUX_RUNTIME_ONE":"REMOLD_LINUX_RUNTIME360");
+  if(!configured.isEmpty())return QDir(QString::fromLocal8Bit(configured)).filePath("sdk.sock");
   return one ? QStringLiteral("/run/kinect-one-remold/sdk.sock")
              : QStringLiteral("/run/kinect360-remold/sdk.sock");
 #endif
@@ -2498,6 +2504,57 @@ class MotionCaptureWindow : public QMainWindow {
     }
     return 0;
   }
+  int checkLiveFusionSolve() {
+    refresh();
+    if(found_.size()<2)return 2;
+    captureMode_->setCurrentIndex(1);
+    bodyEnabled_->setChecked(true);faceEnabled_->setChecked(true);
+    fusionAudit_={};
+    start();
+    if(!worker_||observers_.empty()){stop();return 3;}
+    QElapsedTimer warmup;warmup.start();
+    while(warmup.elapsed()<60000&&
+          (latestPrimaryPose_.isEmpty()||localPoses_.size()<int(captureSensors_.size())-1)) {
+      QApplication::processEvents();QThread::msleep(10);
+    }
+    if(latestPrimaryPose_.isEmpty()||localPoses_.size()<int(captureSensors_.size())-1) {
+      fprintf(stderr,"Fusion solve: cameras did not both produce observations during 60-second warmup\n");
+      stop();return 4;
+    }
+    fprintf(stderr,"Fusion cameras observing after %lld ms; measuring 30 seconds\n",(long long)warmup.elapsed());
+    fusionAudit_={};
+    int combined=0,maxBodySources=0,maxFaceSources=0,maxObserved=0;
+    const size_t initial=history_.size();
+    size_t processed=initial;
+    QHash<QString,int> sensorObserved;
+    QElapsedTimer timer;timer.start();
+    while(timer.elapsed()<30000) {
+      QApplication::processEvents();QThread::msleep(10);
+      while(processed<history_.size()) {
+        const QJsonObject pose=QJsonDocument::fromJson(history_[processed++]).object();
+        const int bodies=pose.value("sensors").toArray().size();
+        const int faces=pose.value("face").toObject().value("sources").toArray().size();
+        maxBodySources=std::max(maxBodySources,bodies);
+        maxFaceSources=std::max(maxFaceSources,faces);
+        maxObserved=std::max(maxObserved,pose.value("observed").toInt());
+        if(bodies>=2)++combined;
+      }
+      for(auto it=localPoses_.cbegin();it!=localPoses_.cend();++it)
+        sensorObserved[it.key()]=std::max(sensorObserved.value(it.key()),
+            QJsonDocument::fromJson(it.value()).object().value("observed").toInt());
+    }
+    fprintf(stderr,"Fusion solve: %zu primary frames, %d fused body frames, max body sources %d, max face sources %d, max observed joints %d\n",
+        processed-initial,combined,maxBodySources,maxFaceSources,maxObserved);
+    for(auto it=sensorObserved.cbegin();it!=sensorObserved.cend();++it)
+      fprintf(stderr,"Observer %s: max %d joints\n",qPrintable(it.key()),it.value());
+    for(auto it=observerErrors_.cbegin();it!=observerErrors_.cend();++it)
+      fprintf(stderr,"Observer %s status: %s\n",qPrintable(it.key()),qPrintable(it.value()));
+    fprintf(stderr,"Fusion gates: missing primary torso %d, stale secondary %d, missing secondary torso %d, torso mismatch %d, joint distance rejected %d, lower-confidence joints %d, accepted joints %d\n",
+        fusionAudit_.primaryTorso,fusionAudit_.stale,fusionAudit_.secondaryTorso,
+        fusionAudit_.torsoMismatch,fusionAudit_.jointDistance,fusionAudit_.confidence,fusionAudit_.accepted);
+    stop();
+    return processed-initial>=10&&combined>=5?0:4;
+  }
   int checkLive(bool requireFace=false,bool requireFullBody=false,
                 bool bodyOn=true,bool faceOn=true) {
     if(found_.empty()) return 2;
@@ -2922,19 +2979,21 @@ class MotionCaptureWindow : public QMainWindow {
     };
     Basis reference;
     if(!basis(joints,reference)) {
+      ++fusionAudit_.primaryTorso;
       const QJsonObject face=combineFaces(faceViews);
       if(!face.isEmpty())primary["face"]=face;
       return primary;
     }
     QJsonArray contributors{primary.value("device").toString()};
     for(auto it=observations.cbegin();it!=observations.cend();++it) {
-      if(it.key()==primary.value("device").toString()||now-times.value(it.key(),0)>freshness)continue;
+      if(it.key()==primary.value("device").toString())continue;
+      if(now-times.value(it.key(),0)>freshness){++fusionAudit_.stale;continue;}
       const QJsonObject observed=QJsonDocument::fromJson(it.value()).object();
       const QJsonArray otherBodies=observed.value("bodies").toArray();
       if(otherBodies.isEmpty())continue;
       const QJsonObject otherJoints=otherBodies.first().toObject().value("joints").toObject();
       Basis source;
-      if(!basis(otherJoints,source))continue;
+      if(!basis(otherJoints,source)){++fusionAudit_.secondaryTorso;continue;}
       auto transform=[&](const QVector3D& p) {
         const QVector3D d=p-source.origin;
         return reference.origin+reference.right*QVector3D::dotProduct(d,source.right)+
@@ -2944,7 +3003,7 @@ class MotionCaptureWindow : public QMainWindow {
       QVector3D sourceShoulder,referenceShoulder;
       point(otherJoints,"shoulderL",sourceShoulder);
       point(joints,"shoulderL",referenceShoulder);
-      if((transform(sourceShoulder)-referenceShoulder).length()>.18f)continue;
+      if((transform(sourceShoulder)-referenceShoulder).length()>.18f){++fusionAudit_.torsoMismatch;continue;}
       int accepted=0;
       for(auto joint=otherJoints.begin();joint!=otherJoints.end();++joint) {
         const QJsonObject candidate=joint.value().toObject();
@@ -2955,13 +3014,14 @@ class MotionCaptureWindow : public QMainWindow {
             float(position[1].toDouble()),float(position[2].toDouble())));
         QVector3D existing;
         const bool hasExisting=point(joints,joint.key().toUtf8().constData(),existing);
-        if(hasExisting&&(mapped-existing).length()>.25f)continue;
-        if(hasExisting&&joints.value(joint.key()).toObject().value("c").toDouble()>=confidence)continue;
+        if(hasExisting&&(mapped-existing).length()>.25f){++fusionAudit_.jointDistance;continue;}
+        if(hasExisting&&joints.value(joint.key()).toObject().value("c").toDouble()>=confidence){++fusionAudit_.confidence;continue;}
         QJsonObject fused=candidate;
         fused["p"]=QJsonArray{mapped.x(),mapped.y(),mapped.z()};
         fused.remove("uv");
         joints[joint.key()]=fused;
         ++accepted;
+        ++fusionAudit_.accepted;
       }
       if(accepted)contributors.append(it.key());
     }
@@ -4126,6 +4186,9 @@ class MotionCaptureWindow : public QMainWindow {
   QHash<QString,int> observerRestarts_;
   QHash<QString,QString> observerErrors_;
   QHash<QString,RoomTransform> roomTransforms_;
+  struct FusionAudit {int primaryTorso=0,stale=0,secondaryTorso=0,torsoMismatch=0,
+      jointDistance=0,confidence=0,accepted=0;};
+  mutable FusionAudit fusionAudit_;
   QString roomReferenceSensor_;
   QByteArray latestPrimaryPose_;
   MocapNetwork network_;MocapWebSocket web_;MocapRig rig_;MocapBvh bvh_;QSaveFile file_;
@@ -4170,6 +4233,8 @@ public:
     modes_->addItems({"Hand landmarks", "Face landmarks"});
 #endif
     auto* refreshButton = new QPushButton("Refresh"); auto* probe = new QPushButton("Probe USB");
+    auto* setup = new QPushButton("Sensor setup");
+    connect(setup,&QPushButton::clicked,this,[this]{showSensorSetup(this);});
     auto* openWindow = new QPushButton("Open sensor window");
     auto* surveillance = new QPushButton("Surveillance");
     auto* scanner = new QPushButton("3D Scanner");
@@ -4195,6 +4260,7 @@ public:
     auto* setTilt = new QPushButton("Set tilt");
     recordButton_ = new QPushButton("Record video");
     row->addWidget(devices_, 1); row->addWidget(modes_); row->addWidget(refreshButton); row->addWidget(openWindow); row->addWidget(probe); row->addWidget(start); row->addWidget(stop);
+    row->addWidget(setup);
     layout->addLayout(row);
     auto* modules = new QHBoxLayout;
     modules->addWidget(surveillance); modules->addWidget(calibration);
@@ -4277,6 +4343,10 @@ public:
     refresh();
   }
   ~MainWindow() override { stopStream(); }
+  void offerSensorSetup() {
+    if(std::none_of(found_.begin(),found_.end(),[](const Device& d){return d.state=="Ready";}))
+      showSensorSetup(this);
+  }
   int checkLiveStreams() {
     refresh();
     const auto ready = std::find_if(found_.begin(), found_.end(), [](const Device& device) {
@@ -4614,14 +4684,17 @@ private:
 
 int main(int argc, char** argv) {
   QApplication app(argc, argv);
-#ifdef Q_OS_MACOS
-  BundledUsbHost nativeUsbHost;
   const QStringList startupArguments=app.arguments();
   const bool diagnostic=std::any_of(startupArguments.cbegin(),startupArguments.cend(),
       [](const QString& arg){return arg.startsWith("--check-");});
   const bool liveDiagnostic=std::any_of(startupArguments.cbegin(),startupArguments.cend(),
       [](const QString& arg){return arg.startsWith("--check-live-")||arg=="--check-stream-handoff";});
+#ifdef Q_OS_MACOS
+  BundledUsbHost nativeUsbHost;
   if(!diagnostic||liveDiagnostic)startBundledUsbHost(nativeUsbHost);
+#elif defined(Q_OS_LINUX)
+  PortableLinuxRuntime portableRuntime;
+  if(!diagnostic||liveDiagnostic)portableRuntime.start();
 #endif
   if(app.arguments().contains("--check-audio-inputs")) {
     int kinectInputs=0;
@@ -5361,10 +5434,15 @@ int main(int argc, char** argv) {
     return depthOnly.translationObservability<.02f&&visual.accepted&&
         result.accepted&&error<.012f?0:2;
   }
-#ifdef Q_OS_MACOS
+#ifdef REMOLD_HAS_ONNX
   if (app.arguments().contains("--check-body-model")) {
+#ifdef Q_OS_MACOS
     OnnxBodyTracker tracker(QCoreApplication::applicationDirPath() +
                             "/../Resources/models/movenet.onnx");
+#else
+    OnnxBodyTracker tracker(QCoreApplication::applicationDirPath() +
+                            "/models/movenet.onnx");
+#endif
     if (!tracker.ready()) {
       fprintf(stderr, "MoveNet model: %s\n", tracker.error().toUtf8().constData());
       return 2;
@@ -5450,6 +5528,10 @@ int main(int argc, char** argv) {
     return scanner.checkLiveFusion(10,true);
   }
 #ifdef REMOLD_HAS_ONNX
+  if (app.arguments().contains("--check-live-fusion-solve")) {
+    MotionCaptureWindow mocap;
+    return mocap.checkLiveFusionSolve();
+  }
   if (app.arguments().contains("--check-live-mocap")) {
     MotionCaptureWindow mocap;
     return mocap.checkLive();
@@ -5476,6 +5558,9 @@ int main(int argc, char** argv) {
   }
 #endif
   window.show();
+#if defined(Q_OS_LINUX) || defined(Q_OS_WIN)
+  if(!diagnostic)QTimer::singleShot(500,&window,[&window]{window.offerSensorSetup();});
+#endif
   return app.exec();
 }
 

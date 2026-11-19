@@ -169,11 +169,48 @@ SynKinect Studio is generated under:
 binaries\windows\applications\SynKinectStudio\
 ```
 
+## Unpack-and-run releases
+
+The native Qt application can be distributed with its runtime, Qt libraries and
+tracking models in one archive per platform. End users extract and launch it;
+Linux USB permissions and Windows's one-time WinUSB setup are explained by the
+GUI's **Sensor setup** dialog. See [portable deployment](docs/PORTABLE-DEPLOYMENT.md)
+for end-user instructions, platform limits, signing and release verification.
+
+Build archives on their target platforms:
+
+```bash
+python3 scripts/linux/PACKAGE-QT.py --ffmpeg
+bash scripts/macos/PACKAGE-QT.sh
+```
+
+```powershell
+powershell -NoProfile -File scripts/windows/Package-Qt.ps1
+```
+
+Archives and SHA-256 checksums are generated under `binaries/releases/`. These
+packages contain the Qt frontend and Kinect v2 runtime; Xbox 360 services and
+the Processing Studio remain separate. Linux compatibility follows the build
+host's glibc baseline, so build public releases on the oldest supported distro.
+
+## Native Qt on Linux AMD64
+
+For the same native Qt frontend on **Linux AMD64**, including Arch packages
+(`onnxruntime-cpu`), USB permissions, builds, model downloads and RGB/depth/IR
+verification, follow the [Linux Qt quickstart](docs/LINUX-QT-QUICKSTART.md).
+After installing dependencies and the USB rule, run `./Kinect-Remold-linux-qt.sh`
+to build and launch Qt with a temporary v2 runtime, or pass `--build-only`.
+The root CMake project builds Qt and the native Kinect v2 service on Linux and
+Windows; `-DREMOLD_BUILD_QT=OFF` builds the service without Qt/ONNX dependencies.
+macOS keeps its native IOUSBHost backend. Cross-platform source support does not
+replace hardware/regression testing on each operating system.
+
 ## macOS (Apple Silicon)
 
 For native Qt capture workflows, see the [Qt user guide](docs/QT-USER-GUIDE.md).
 For implementation status and improvement priorities, see the
 [Qt developer guide](docs/QT-DEVELOPER-GUIDE.md).
+
 
 The macOS build uses Apple's IOKit/IOUSBHost APIs for native Kinect USB
 discovery. Its Qt frontend uses the same local driver protocol as SynKinect
@@ -262,8 +299,14 @@ an orbitable stage, a 60-second pose timeline, JSON/OSC/VMC/WebSocket outputs,
 mirrored Unity rig output and BVH recording. It can publish observations and
 preview authenticated remote sensor hosts over mutual-TLS WebSockets. Remote
 observations are **preview-only**; clock discipline, room calibration,
-multi-person association and multi-sensor fusion remain unfinished. See
+multi-person association and capture-grade cross-host fusion remain unfinished. See
 [Qt Motion Capture workspace](docs/QT-MOCAP-WORKSPACE.md).
+Local **One person · combine local sensors** motion capture is implemented in
+the shared Qt code on Linux, Windows and macOS. It combines recent body-joint
+observations through shoulder/hip alignment and combines facial expressions
+from confident views. Both cameras must see the same person's shoulders and
+hips; this is observation-level fusion, without hardware synchronization or
+measured multi-camera triangulation. See [multi-sensor motion capture](docs/QT-MULTI-PERSON-MOCAP.md).
 The latest camera Start action takes ownership of that sensor across Qt windows.
 Motion Capture defaults to a large video overlay and shows a green, yellow, or
 red local-fit marker with framing and joint-quality guidance. Body joints are

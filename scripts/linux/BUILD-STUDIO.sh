@@ -345,7 +345,7 @@ if [[ "${REMOLD_FULL_BUILD:-0}" == 1 ]]; then
     "$K1_DRIVER_DIST/KINECT.sh"
     "$K1_DRIVER_DIST/INSTALL.sh"
     "$K1_DRIVER_DIST/UNINSTALL.sh"
-    "$K1_DRIVER_DIST/90-kinect-one-remold.rules"
+    "$K1_DRIVER_DIST/70-kinect-one-remold.rules"
     "$K1_DRIVER_DIST/kinect-one-remold.service"
   )
   for artifact in "${required_driver[@]}" "${required_kinect_one[@]}"; do

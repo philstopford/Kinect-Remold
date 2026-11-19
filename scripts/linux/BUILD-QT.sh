@@ -7,12 +7,12 @@ WORK="${REMOLD_WORK_ROOT:-${TMPDIR:-/tmp}/kinect-remold-build}/linux/qt"
 OUTPUT="$ROOT/binaries/linux/applications/KinectRemoldQt"
 command -v cmake >/dev/null 2>&1 || { echo 'CMake is required.' >&2; exit 2; }
 mkdir -p "$WORK" "$OUTPUT"
-cmake -S "$ROOT/applications/qt" -B "$WORK" -DCMAKE_BUILD_TYPE=Release
+cmake -S "$ROOT/applications/qt" -B "$WORK" -DCMAKE_BUILD_TYPE=Release "$@"
 cmake --build "$WORK" --config Release --parallel
 install -m 0755 "$WORK/KinectRemoldQt" "$OUTPUT/KinectRemoldQt"
 mkdir -p "$OUTPUT/licenses/libfreenect2"
 cp "$ROOT/third_party/licenses/libfreenect2/"* "$OUTPUT/licenses/libfreenect2/"
-onnx_library="$(ldd "$WORK/KinectRemoldQt" | awk '/libonnxruntime\.so/ {print $3; exit}')"
+onnx_library="$(ldd "$WORK/KinectRemoldQt" | awk '/libonnxruntime\.so/ && !found {print $3; found=1}')"
 [[ -f "$onnx_library" ]] || { echo 'ONNX Runtime shared library was not found for packaging.' >&2; exit 1; }
 install -m 0644 "$onnx_library" "$OUTPUT/libonnxruntime.so.1"
 mkdir -p "$OUTPUT/models"

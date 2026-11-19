@@ -23,7 +23,7 @@ RUNTIME_DIR="$REMOLD_LIBEXECDIR/$MODULE_ID"
 DATA_DIR="$REMOLD_DATADIR/$MODULE_ID"
 RUN_DIR="$REMOLD_RUNDIR/$MODULE_ID"
 SERVICE_PATH="$REMOLD_SYSTEMD_UNIT_DIR/kinect-one-remold.service"
-RULE_PATH="$REMOLD_UDEV_RULES_DIR/90-kinect-one-remold.rules"
+RULE_PATH="$REMOLD_UDEV_RULES_DIR/70-kinect-one-remold.rules"
 CONTROL_PATH="$REMOLD_BINDIR/kinect-one-remoldctl"
 
 stage '[1/4] Stopping and removing runtime service...'

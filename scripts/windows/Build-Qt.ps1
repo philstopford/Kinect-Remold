@@ -1,6 +1,7 @@
 param(
     [string]$QtPrefix = $env:QT_PREFIX,
     [string]$OnnxRuntimeDir = $env:onnxruntime_DIR,
+    [string]$OnnxRuntimeRoot = $env:ONNXRUNTIME_ROOT,
     [string]$MoveNetModel = $env:REMOLD_MOVENET_MODEL
 )
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,7 @@ New-Item -ItemType Directory -Path @($work, $output) -Force | Out-Null
 $configure = @('-S', (Join-Path $repo 'applications\qt'), '-B', $work)
 if ($QtPrefix) { $configure += "-DCMAKE_PREFIX_PATH=$QtPrefix" }
 if ($OnnxRuntimeDir) { $configure += "-Donnxruntime_DIR=$OnnxRuntimeDir" }
+if ($OnnxRuntimeRoot) { $configure += "-DONNXRUNTIME_ROOT=$OnnxRuntimeRoot" }
 & cmake @configure
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & cmake --build $work --config Release --parallel
@@ -26,9 +28,10 @@ Copy-Item -Path (Join-Path $repo 'third_party\licenses\libfreenect2\*') -Destina
 $deploy = if ($QtPrefix -and (Test-Path -LiteralPath (Join-Path $QtPrefix 'bin\windeployqt.exe'))) {
     Join-Path $QtPrefix 'bin\windeployqt.exe'
 } else { 'windeployqt.exe' }
-& $deploy --release (Join-Path $output 'KinectRemoldQt.exe')
+& $deploy --release --compiler-runtime (Join-Path $output 'KinectRemoldQt.exe')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $runtimePackage = $OnnxRuntimeDir
+if (-not $runtimePackage) { $runtimePackage = $OnnxRuntimeRoot }
 if (-not $runtimePackage) {
     $cacheLine = Get-Content -LiteralPath (Join-Path $work 'CMakeCache.txt') |
         Where-Object { $_ -match '^onnxruntime_DIR:PATH=' } | Select-Object -First 1

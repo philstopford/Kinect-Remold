@@ -1,6 +1,6 @@
 #pragma once
 
-#include <onnxruntime/onnxruntime_cxx_api.h>
+#include "OnnxRuntime.hpp"
 #include <QByteArray>
 #include <QString>
 #include <algorithm>

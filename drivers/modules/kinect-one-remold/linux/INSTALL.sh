@@ -14,7 +14,7 @@ stage(){ printf '%s\n' "$1"; }
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Accept either the prepared distribution bundle or a source-tree invocation.
-if [[ -x "$HERE/kinect-one-remold" && -f "$HERE/90-kinect-one-remold.rules" && -f "$HERE/kinect-one-remold.service" ]]; then
+if [[ -x "$HERE/kinect-one-remold" && -f "$HERE/70-kinect-one-remold.rules" && -f "$HERE/kinect-one-remold.service" ]]; then
   BUNDLE="$HERE"
 else
   PROJECT="$HERE"
@@ -26,7 +26,7 @@ else
 fi
 
 BIN="$BUNDLE/kinect-one-remold"
-RULE="$BUNDLE/90-kinect-one-remold.rules"
+RULE="$BUNDLE/70-kinect-one-remold.rules"
 SERVICE="$BUNDLE/kinect-one-remold.service"
 UNINSTALL="$BUNDLE/UNINSTALL.sh"
 CONTROL="$BUNDLE/KINECT.sh"
@@ -42,7 +42,7 @@ MAINT_DIR="$DATA_DIR/maintenance"
 STATE_DIR="$REMOLD_LOCALSTATEDIR/$MODULE_ID"
 RUN_DIR="$REMOLD_RUNDIR/$MODULE_ID"
 CONTROL_PATH="$REMOLD_BINDIR/kinect-one-remoldctl"
-RULE_PATH="$REMOLD_UDEV_RULES_DIR/90-kinect-one-remold.rules"
+RULE_PATH="$REMOLD_UDEV_RULES_DIR/70-kinect-one-remold.rules"
 SERVICE_PATH="$REMOLD_SYSTEMD_UNIT_DIR/kinect-one-remold.service"
 
 for command_name in cmp install mkdir rm sha256sum sleep systemctl udevadm; do
@@ -74,7 +74,7 @@ if [[ "$(readlink -f "$BUNDLE")" != "$(readlink -m "$MAINT_DIR")" ]]; then
   install -m 0755 "$BUNDLE/INSTALL.sh" "$MAINT_DIR/INSTALL.sh"
   install -m 0755 "$CONTROL" "$MAINT_DIR/KINECT.sh"
   install -m 0755 "$UNINSTALL" "$MAINT_DIR/UNINSTALL.sh"
-  install -m 0644 "$RULE" "$MAINT_DIR/90-kinect-one-remold.rules"
+  install -m 0644 "$RULE" "$MAINT_DIR/70-kinect-one-remold.rules"
   install -m 0644 "$SERVICE" "$MAINT_DIR/kinect-one-remold.service"
   install -m 0755 "$ENV_HELPER" "$MAINT_DIR/remold-env.sh"
 fi

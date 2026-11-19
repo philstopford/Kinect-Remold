@@ -1,7 +1,7 @@
 #include "OnnxFaceTracker.hpp"
 #include "OnnxExecutionProvider.hpp"
 
-#include <onnxruntime/onnxruntime_cxx_api.h>
+#include "OnnxRuntime.hpp"
 #include <QJsonArray>
 #include <QLineF>
 #include <QFileInfo>

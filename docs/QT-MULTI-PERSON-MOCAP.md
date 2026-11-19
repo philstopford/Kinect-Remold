@@ -38,3 +38,43 @@ On the controller machine, open **Motion Capture → Sensors & LAN**, enter its 
 On each sensor host, choose a local layout, select its sensor, enable the same capture channels needed at the controller, enter that host's TLS certificate and private key plus the trusted CA, and set the controller URL (`wss://controller-host:39550/`). Select **Join controller**, then **Start tracking**. A host with several working local sensors sends an observation from each sensor. The controller records and processes the body and face observations without opening a capture window for every sensor on the controller.
 
 For remote multi-person capture, the first observed sensor becomes `person-1`; other sensor tracks are assigned in first-observation order. Each sensor should stay assigned to one person for that take. Align a shared calibration pose, or enter measured placement in **Sensors & LAN**, for room-space body tracks. Remote fusion combines fresh body joints and expression scores using the same rules as local fusion. These are observation-level solves; the current trackers detect one person per sensor, and facial landmarks remain in the source camera's image coordinates. Controller frames use receipt time because clock synchronization between hosts is not yet available; keep LAN latency low for interaction capture.
+
+## Linux local-fusion verification
+
+The one-person local fusion path uses the same Qt/ONNX code on Linux, Windows
+and macOS. In **Motion Capture**, choose **One person · combine local sensors**,
+keep both cameras aimed at the same person, enable the capture sources and press
+**Start tracking**. The sensor table should show observations from both cameras.
+The “body N sensor(s)” count increases only when another camera contributes a
+joint, rather than merely being connected. The solve maps joints through the
+observed shoulder/hip torso frames; this is not a measured, fixed extrinsic
+calibration or synchronized multi-view triangulation. Observations older than
+200 ms by local receipt time are excluded from local fusion.
+
+A diagnostic for the actual local body-fusion path is available in current
+builds:
+
+```bash
+# Run with one person visible to both cameras. After up to 60 seconds of
+# tracker warmup, the check measures 30 seconds of capture.
+# From an extracted archive:
+./KinectRemoldQt.sh --check-live-fusion-solve
+# Or from a source build, with its runtime configured:
+binaries/linux/applications/KinectRemoldQt/KinectRemoldQt --check-live-fusion-solve
+```
+
+Exit zero requires at least ten primary output frames and five frames with body
+joints contributed by multiple cameras. The report also includes maximum face
+contributors and joint counts. Missing or poorly framed people can fail this
+check even when both USB streams work. The test does not require both faces to
+be detected, and does not establish motion accuracy or long-duration stability.
+
+On Arch Linux AMD64, the attached `02c4` and `02d8` sensors both streamed RGB,
+depth and IR concurrently. With one person framed in both views, the warmed
+30-second local-fusion check passed: 137 output poses, six poses with body
+contributions from both sensors, 153 accepted secondary joints, and up to two
+face contributors. No torso-alignment mismatches were reported. Earlier cropped
+views produced too few usable body observations to pass. The measured result
+confirms execution of the shared fusion path on Linux, not continuous two-view
+contributions or calibrated motion accuracy. The solver retains stronger
+existing joints instead of forcing an average of both cameras.

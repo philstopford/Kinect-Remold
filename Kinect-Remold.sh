@@ -118,7 +118,7 @@ required=(
   "$K1_DIST/KINECT.sh"
   "$K1_DIST/INSTALL.sh"
   "$K1_DIST/UNINSTALL.sh"
-  "$K1_DIST/90-kinect-one-remold.rules"
+  "$K1_DIST/70-kinect-one-remold.rules"
   "$K1_DIST/kinect-one-remold.service"
   "$STUDIO_HOME/SynKinectStudio.sh"
   "$STUDIO_HOME/lib/SynKinectStudio.jar"

@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <poll.h>
 #include <unistd.h>
 
 namespace {
@@ -192,10 +193,12 @@ public:
             // Service isochronous completions first, then poll RGB with a tiny timeout.
             timeval tv{0,2000}; (void)libusb_handle_events_timeout_completed(context_,&tv,nullptr);
             if(isoFailed_) return false;
-            drainDepth(client,mask,frame);
+            if(!drainDepth(client,mask,frame)) return false;
             if(!((mask&StreamRgb)||(mask&StreamRgbHighQuality))){std::this_thread::sleep_for(std::chrono::milliseconds(1));continue;}
             int transferred=0; int r=libusb_bulk_transfer(handle_,KinectOneNativeUsb::ColorIn,colorChunk.data(),static_cast<int>(colorChunk.size()),&transferred,4);
-            if(r==LIBUSB_SUCCESS&&transferred>0){
+            // libusb may return a partial bulk read with TIMEOUT. Those bytes
+            // still belong to the JPEG stream and must reach the assembler.
+            if((r==LIBUSB_SUCCESS||r==LIBUSB_ERROR_TIMEOUT)&&transferred>0){
                 jpegAssembler_.push(colorChunk.data(),static_cast<std::size_t>(transferred));
                 while(jpegAssembler_.pop(jpeg)){
                     const StreamMode mode=(mask&StreamRgbHighQuality)?StreamMode::RgbHighQuality:StreamMode::Rgb;
@@ -284,7 +287,7 @@ private:
             if(needIr&&!sendFrame(client,StreamMode::Infrared,512,424,PixelFormat::InfraredU16,reinterpret_cast<const std::uint8_t*>(ir.data()),ir.size()*2,++frame))return false;}
         return true;
     }
-    bool writeAll(int fd,const void* data,std::size_t bytes){const auto* p=static_cast<const std::uint8_t*>(data);while(bytes){ssize_t n=::write(fd,p,bytes);if(n<=0)return false;p+=n;bytes-=static_cast<std::size_t>(n);}return true;}
+    bool writeAll(int fd,const void* data,std::size_t bytes){const auto* p=static_cast<const std::uint8_t*>(data);while(bytes){ssize_t n=::send(fd,p,bytes,MSG_NOSIGNAL);if(n<0&&errno==EINTR)continue;if(n<=0)return false;p+=n;bytes-=static_cast<std::size_t>(n);}return true;}
     bool sendFrame(int client,StreamMode mode,std::uint32_t w,std::uint32_t h,PixelFormat format,const std::uint8_t* data,std::size_t bytes,std::uint64_t frameNo){
         FrameHeader header{};header.mode=mode;header.width=w;header.height=h;header.pixelFormat=format;header.payloadBytes=static_cast<std::uint32_t>(bytes);header.frameNumber=frameNo;header.tickMs=tickMs();return writeAll(client,&header,sizeof(header))&&writeAll(client,data,bytes);
     }
@@ -365,7 +368,16 @@ void stopSignal(int){g_running=false;}
 int main(){
     std::signal(SIGINT,stopSignal);std::signal(SIGTERM,stopSignal);libusb_context* context=nullptr;if(libusb_init(&context)!=LIBUSB_SUCCESS)return 2;std::error_code ec;auto runtime=runtimeDirectory();std::filesystem::create_directories(runtime,ec);auto socketPathValue=socketPath().string();unlink(socketPathValue.c_str());
     const int server=socket(AF_UNIX,SOCK_STREAM,0);if(server<0){libusb_exit(context);return 3;}sockaddr_un address{};address.sun_family=AF_UNIX;std::strncpy(address.sun_path,socketPathValue.c_str(),sizeof(address.sun_path)-1);if(bind(server,reinterpret_cast<sockaddr*>(&address),sizeof(address))!=0||listen(server,16)!=0){close(server);libusb_exit(context);return 4;}chmod(socketPathValue.c_str(),0666);
-    while(g_running){const int client=accept(server,nullptr,nullptr);if(client<0){if(!g_running)break;if(errno==EINTR)continue;std::this_thread::sleep_for(std::chrono::milliseconds(20));continue;}
+    while(g_running){
+        // signal() may install SA_RESTART, so an idle accept() cannot be relied
+        // on to wake on SIGTERM. Bound the wait before accepting a client.
+        pollfd pending{server,POLLIN,0};
+        const int events=poll(&pending,1,100);
+        if(events<0){if(errno==EINTR)continue;break;}
+        if(!g_running)break;
+        if(events==0)continue;
+        if(!(pending.revents&POLLIN))break;
+        const int client=accept(server,nullptr,nullptr);if(client<0){if(!g_running)break;if(errno==EINTR)continue;std::this_thread::sleep_for(std::chrono::milliseconds(20));continue;}
         timeval ioTimeout{kClientIoTimeoutMs/1000,(kClientIoTimeoutMs%1000)*1000};
         (void)setsockopt(client,SOL_SOCKET,SO_RCVTIMEO,&ioTimeout,sizeof(ioTimeout));
         (void)setsockopt(client,SOL_SOCKET,SO_SNDTIMEO,&ioTimeout,sizeof(ioTimeout));

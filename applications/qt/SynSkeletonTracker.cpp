@@ -1,7 +1,7 @@
 #include "SynSkeletonTracker.hpp"
 #include "OnnxExecutionProvider.hpp"
 
-#include <onnxruntime/onnxruntime_cxx_api.h>
+#include "OnnxRuntime.hpp"
 #include <QPainter>
 #include <QPen>
 #include <algorithm>

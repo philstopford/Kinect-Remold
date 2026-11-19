@@ -49,6 +49,6 @@ if ! mkdir -p -- "$OUT"; then
 fi
 cp "$BUILD/kinect-one-remold" "$OUT/"
 cp "$(dirname "$0")/KINECT.sh" "$(dirname "$0")/INSTALL.sh" "$(dirname "$0")/UNINSTALL.sh" "$OUT/"
-cp "$SOURCE/90-kinect-one-remold.rules" "$SOURCE/kinect-one-remold.service" "$OUT/"
+cp "$SOURCE/70-kinect-one-remold.rules" "$SOURCE/kinect-one-remold.service" "$OUT/"
 cp "$ENV_HELPER" "$OUT/remold-env.sh"
 chmod +x "$OUT/kinect-one-remold" "$OUT/KINECT.sh" "$OUT/INSTALL.sh" "$OUT/UNINSTALL.sh" "$OUT/remold-env.sh"
