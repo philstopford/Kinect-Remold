@@ -23,5 +23,6 @@ class RgbdRegistration {
       const DepthCalibrationProfile* calibration,int colorWidth,int colorHeight,
       bool kinectOne,const std::array<BodyKeypoint,17>& body,
       const std::array<std::array<BodyKeypoint,21>,2>& hands,
-      float expectedPersonDepth=0);
+      float expectedPersonDepth=0,
+      const std::array<MetricPoseJoint,jointCount>* previous=nullptr);
 };

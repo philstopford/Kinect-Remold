@@ -68,9 +68,9 @@ QJsonObject ArticulatedPoseFit::fit(QJsonObject frame) {
     }
     bone.locked=true;
   }
-  // Fit all connected joints together. Observation and temporal terms compete
-  // with fixed bone lengths; each projection moves both ends according to their
-  // confidence, so a clear joint anchors an uncertain neighbour.
+  // Fit connected joints while keeping shoulders and hips anchored to their
+  // observations. Limb length corrections should not pull the torso around
+  // when an elbow, wrist, knee or ankle moves.
   for(int i=0;i<count;++i)if(!joints[i].valid&&previousValid_[i]&&
       lastTime_>0&&time-lastTime_>0&&time-lastTime_<.12) {
     joints[i].position=previous_[i];joints[i].confidence=.06f;joints[i].valid=true;
@@ -79,7 +79,8 @@ QJsonObject ArticulatedPoseFit::fit(QJsonObject frame) {
     for(auto& j:joints)if(j.valid&&j.confidence>=.15f)
       j.position+=(j.observed-j.position)*(iteration==0?.30f:.12f)*
           std::clamp(j.confidence,.2f,1.f);
-    for(const auto& bone:bones_) {
+    for(int boneIndex=0;boneIndex<int(bones_.size());++boneIndex) {
+      const auto& bone=bones_[boneIndex];
       if(bone.length<=0)continue;
       Joint& a=joints[bone.a];Joint& b=joints[bone.b];
       if(!a.valid||!b.valid)continue;
@@ -89,8 +90,21 @@ QJsonObject ArticulatedPoseFit::fit(QJsonObject frame) {
       const QVector3D correction=delta*((distance-bone.length)/distance*.75f);
       const float wa=1.f/std::max(.08f,a.confidence);
       const float wb=1.f/std::max(.08f,b.confidence);
-      a.position+=correction*(wa/(wa+wb));
-      b.position-=correction*(wb/(wa+wb));
+      float parentShare=wa/(wa+wb);
+      if(boneIndex>=4)parentShare=std::min(parentShare,boneIndex%2==0?.04f:.25f);
+      a.position+=correction*parentShare;
+      b.position-=correction*(1.f-parentShare);
+    }
+  }
+  // The spatial solve is independent each frame. Keep a quiet joint near its
+  // previous fitted position; release the anchor as real movement grows.
+  if(lastTime_>0&&time>lastTime_&&time-lastTime_<.25) {
+    for(int i=0;i<count;++i)if(joints[i].valid&&previousValid_[i]) {
+      const QVector3D delta=joints[i].position-previous_[i];
+      const float distance=delta.length();
+      const float response=std::clamp((distance-.012f)/.09f,0.f,1.f);
+      const float alpha=.18f+.82f*response;
+      joints[i].position=previous_[i]+delta*alpha;
     }
   }
   // The limb graph is a tree below the shoulders and hips. A final outward

@@ -517,6 +517,8 @@ protected:
     bool poseCalibrationChecked=false;
     float personDepth=0;
     int personDepthMisses=0;
+    std::array<MetricPoseJoint,RgbdRegistration::jointCount> previousLift{};
+    quint64 previousLiftTick=0;
     const bool profileMocap=!qEnvironmentVariableIsEmpty("REMOLD_PROFILE_MOCAP");
     double bodyMs=0,handMs=0,faceMs=0,liftMs=0;
     int profileFrames=0;
@@ -562,8 +564,7 @@ protected:
       // Retain metric depth for export while the landmark preview stays RGB.
       if (overlay_ > 0 && overlay_ != 4 && device_.generation == QStringLiteral("xbox-one") &&
           format != KinectOneRemoldProtocol::Jpeg) continue;
-#ifndef Q_OS_MACOS
-      if((overlay_==5||overlay_==7)&&
+      if((overlay_==5||overlay_==6||overlay_==7)&&
          (format==KinectOneRemoldProtocol::Jpeg||format==4||format==0x41524742u)) {
         // Inference can be slower than acquisition. Keep draining depth and
         // skip superseded RGB frames instead of accumulating capture latency.
@@ -571,7 +572,6 @@ protected:
         if(remold::hasQueuedRgbFrame(socket.peek(std::min<qint64>(socket.bytesAvailable(),
                                                32ll*1024*1024))))continue;
       }
-#endif
       QImage image = decode(payload, width, height, format);
       if(!image.isNull()&&(format==KinectOneRemoldProtocol::Jpeg||
                             format==4||format==0x41524742u))emit rgbReady(image,frameTick);
@@ -626,7 +626,9 @@ protected:
             const auto pose=RgbdRegistration::lift(latestDepth,latestCamera,&poseCalibration,
                 image.width(),image.height(),device_.generation==QStringLiteral("xbox-one"),
                 body->keypoints(),hands?hands->keypoints():
-                    std::array<std::array<BodyKeypoint,21>,2>{},personDepth);
+                    std::array<std::array<BodyKeypoint,21>,2>{},personDepth,
+                previousLiftTick&&frameTick>previousLiftTick&&frameTick-previousLiftTick<250?
+                    &previousLift:nullptr);
             if(profileMocap){liftMs+=phase.nsecsElapsed()*1e-6;
               if(++profileFrames%60==0) {
                 qInfo("Mocap stage ms/frame (%d): body %.2f hands %.2f face %.2f RGBD lift %.2f",
@@ -641,6 +643,7 @@ protected:
               if(pose[index].valid&&pose[index].confidence>=.2f)
                 torsoDepths.push_back(pose[index].point.z());
             if(torsoDepths.size()>=3) {
+              previousLift=pose;previousLiftTick=frameTick;
               std::sort(torsoDepths.begin(),torsoDepths.end());
               const float measured=torsoDepths[torsoDepths.size()/2];
               if(personDepth==0||std::abs(measured-personDepth)<.35f) {
@@ -2457,7 +2460,7 @@ class MotionCaptureWindow : public QMainWindow {
     const auto blended=fuseLocalPose(pose("primary",joints));
     const auto blendedJoints=blended["bodies"].toArray()[0].toObject()["joints"].toObject();
     const double x=blendedJoints["wristL"].toObject()["p"].toArray()[0].toDouble();
-    if(std::abs(x+.35)>.001||blendedJoints["wristL"].toObject()["uv"]!=joints["wristL"].toObject()["uv"])return 2;
+    if(std::abs(x+.38)>.001||blendedJoints["wristL"].toObject()["uv"]!=joints["wristL"].toObject()["uv"])return 2;
     for(const char* name:{"wristL","wristR","ankleL","ankleR"})joints.remove(name);
     const auto recovered=fuseLocalPose(pose("primary",joints));
     if(updateCaptureQuality(recovered)["state"]!="green")return 3;
@@ -2481,6 +2484,9 @@ class MotionCaptureWindow : public QMainWindow {
         {"blendshapes",QJsonObject{{"jawOpen",.2}}}};
     const QJsonObject turned=combineFaces({{"profile",profile},{"frontal",frontal}});
     const double turnedJaw=turned.value("blendshapes").toObject().value("jawOpen").toDouble();
+    const QJsonObject nearby{{"tracked",true},{"confidence",.86},
+        {"landmarks",right},{"blendshapes",QJsonObject{{"jawOpen",.8}}}};
+    const QJsonObject held=combineFaces({{"sensor-a",a},{"sensor-b",nearby}},"sensor-b");
     auto view=[&](double yaw,const QString& state,const QString& reason) {
       return QJsonObject{{"tracked",true},{"confidence",.97},
           {"blendshapes",QJsonObject{{"jawOpen",.3}}},
@@ -2512,6 +2518,7 @@ class MotionCaptureWindow : public QMainWindow {
         fused.value("sourceSensor")=="sensor-a"&&
         fused.value("landmarks").toArray()==left&&jaw>.4&&jaw<.5&&
         turned.value("sourceSensor")=="frontal"&&
+        held.value("sourceSensor")=="sensor-b"&&
         turned.value("landmarks").toArray()==right&&
         turned.value("sources").toArray().size()==2&&turnedJaw>.2&&turnedJaw<.4&&
         complementary.value("quality").toObject().value("state")=="green"&&
@@ -2899,7 +2906,8 @@ class MotionCaptureWindow : public QMainWindow {
           QVector3D(float(field.x->value()),float(field.y->value()),float(field.z->value()))};
     status_->setText(QString("Measured placement set for %1 sensor(s)").arg(fields.size()));
   }
-  static QJsonObject combineFaces(const std::vector<std::pair<QString,QJsonObject>>& views) {
+  static QJsonObject combineFaces(const std::vector<std::pair<QString,QJsonObject>>& views,
+                                  const QString& preferredSensor={}) {
     auto viewWeight=[](const QJsonObject& face) {
       if(!face.value("tracked").toBool())return 0.;
       const double confidence=face.value("confidence").toDouble();
@@ -2924,6 +2932,12 @@ class MotionCaptureWindow : public QMainWindow {
       }
     }
     if(best.isEmpty())return {};
+    // Keep the mesh in one camera's coordinates while similarly good views
+    // trade small confidence differences from frame to frame.
+    for(const auto& view:views)if(view.first==preferredSensor&&
+        viewWeight(view.second)>=bestWeight*.85) {
+      best=view.second;bestSensor=view.first;break;
+    }
     QJsonObject sums,weights;
     QJsonArray sources;
     for(const auto& view:views) {
@@ -2994,7 +3008,8 @@ class MotionCaptureWindow : public QMainWindow {
           primary["sourceSensor"]=it.key();
         }
       }
-      const QJsonObject face=combineFaces(faceViews);
+      const QJsonObject face=combineFaces(faceViews,faceSource_);
+      faceSource_=face.value("sourceSensor").toString();
       if(!face.isEmpty())primary["face"]=face;
       return primary;
     }
@@ -3024,7 +3039,8 @@ class MotionCaptureWindow : public QMainWindow {
     Basis reference;
     if(!basis(joints,reference)) {
       ++fusionAudit_.primaryTorso;
-      const QJsonObject face=combineFaces(faceViews);
+      const QJsonObject face=combineFaces(faceViews,faceSource_);
+      faceSource_=face.value("sourceSensor").toString();
       if(!face.isEmpty())primary["face"]=face;
       return primary;
     }
@@ -3066,7 +3082,11 @@ class MotionCaptureWindow : public QMainWindow {
         QVector3D positionInPrimary=mapped;
         if(hasExisting) {
           const double primaryConfidence=fused.value("c").toDouble();
-          const double weight=confidence/(primaryConfidence+confidence);
+          // A confident primary observation anchors the rig. The secondary
+          // camera still fills gaps, but its noisy frame-by-frame torso basis
+          // cannot move an already clear joint halfway across the disagreement.
+          const double weight=confidence/(primaryConfidence+confidence)*
+              std::clamp(1.-primaryConfidence,.4,1.);
           positionInPrimary=existing*(1.f-float(weight))+mapped*float(weight);
           fused["c"]=std::max(primaryConfidence,confidence);
         } else {
@@ -3085,7 +3105,8 @@ class MotionCaptureWindow : public QMainWindow {
       body["joints"]=joints;primary["bodies"]=QJsonArray{body};
       primary["observed"]=joints.size();primary["sensors"]=contributors;
     }
-    const QJsonObject face=combineFaces(faceViews);
+    const QJsonObject face=combineFaces(faceViews,faceSource_);
+    faceSource_=face.value("sourceSensor").toString();
     if(!face.isEmpty())primary["face"]=face;
     return primary;
   }
@@ -3131,6 +3152,7 @@ class MotionCaptureWindow : public QMainWindow {
     if(!bodyOn)calibrationList_->setCurrentRow(3);
     else if(!faceOn)calibrationList_->setCurrentRow(0);
     smoother_.reset();
+    faceSource_.clear();
     bodyFit_.reset();
     clipFile_.close();clipIndex_.reset();
     smoother_.setStability(stability_->value());
@@ -4251,6 +4273,7 @@ class MotionCaptureWindow : public QMainWindow {
   struct FusionAudit {int primaryTorso=0,stale=0,secondaryTorso=0,torsoMismatch=0,
       jointDistance=0,accepted=0;};
   mutable FusionAudit fusionAudit_;
+  mutable QString faceSource_;
   QString roomReferenceSensor_;
   QByteArray latestPrimaryPose_;
   MocapNetwork network_;MocapWebSocket web_;MocapRig rig_;MocapBvh bvh_;QSaveFile file_;
@@ -5129,7 +5152,76 @@ int main(int argc, char** argv) {
     const float upper=(pos("shoulderL")-pos("elbowL")).length();
     const float lower=(pos("elbowL")-pos("wristL")).length();
     fprintf(stderr,"Articulated fit: upper %.4f lower %.4f\n",upper,lower);
-    return std::abs(upper-.30f)<.025f&&std::abs(lower-.27f)<.025f?0:2;
+    float low=1e6f,high=-1e6f;
+    for(int i=36;i<56;++i) {
+      const QJsonObject result=frame(i,i%2?.035:-.035).value("bodies").toArray()[0]
+          .toObject().value("joints").toObject();
+      const float y=float(result.value("elbowL").toObject().value("p").toArray()[1].toDouble());
+      if(i>=42){low=std::min(low,y);high=std::max(high,y);}
+    }
+    fprintf(stderr,"Articulated fit: still elbow range %.4f m\n",high-low);
+    const QJsonObject moving=frame(56,.25).value("bodies").toArray()[0].toObject()
+        .value("joints").toObject();
+    auto axis=[&](const char* name,int coordinate) {
+      return moving.value(name).toObject().value("p").toArray()[coordinate].toDouble();
+    };
+    const double unrelated=std::max({std::abs(axis("shoulderL",1)),
+        std::abs(axis("shoulderR",1)),std::abs(axis("hipL",1)-.48),
+        std::abs(axis("hipR",1)-.48),std::abs(axis("elbowR",1)-.3)});
+    fprintf(stderr,"Articulated fit: unrelated movement %.4f m\n",unrelated);
+    return std::abs(upper-.30f)<.025f&&std::abs(lower-.27f)<.025f&&
+        high-low<.025f&&unrelated<.012?0:2;
+  }
+  if (app.arguments().contains("--check-depth-continuity")) {
+    DepthIntrinsics camera{64,48,53,53,32,24,{}};
+    QByteArray depth(64*48*2,0);
+    for(int y=0;y<48;++y)for(int x=0;x<64;++x) {
+      const quint16 mm=x==31&&y==23?4000:2000;
+      const int offset=(y*64+x)*2;
+      depth[offset]=char(mm&255);depth[offset+1]=char(mm>>8);
+    }
+    std::array<BodyKeypoint,17> body{};
+    body[0]={31.74f/64.f,25.61f/48.f,.9f};
+    const std::array<std::array<BodyKeypoint,21>,2> hands{};
+    const auto unanchored=RgbdRegistration::lift(depth,camera,nullptr,64,48,false,body,hands);
+    auto prior=unanchored;
+    prior[0]={QVector3D(0,0,2),.9f,true};
+    const auto anchored=RgbdRegistration::lift(depth,camera,nullptr,64,48,false,body,hands,0,&prior);
+    fprintf(stderr,"Depth continuity: nearest %.3f m, anchored %.3f m\n",
+        unanchored[0].point.z(),anchored[0].point.z());
+    return unanchored[0].valid&&anchored[0].valid&&
+        unanchored[0].point.z()>3.5f&&anchored[0].point.z()<2.5f?0:2;
+  }
+  if (app.arguments().contains("--check-rig-stability")) {
+    MocapRig rig;
+    auto frame=[&](int index,float elbowY) {
+      QJsonObject joints;
+      auto add=[&](const char* name,float x,float y) {
+        joints[name]=QJsonObject{{"p",QJsonArray{x,y,2.}},{"c",.9}};
+      };
+      add("shoulderL",.2f,-.5f);add("shoulderR",-.2f,-.5f);
+      add("hipL",.15f,0);add("hipR",-.15f,0);
+      add("elbowL",.5f,elbowY);add("elbowR",-.5f,-.5f);
+      add("wristL",.8f,elbowY);add("wristR",-.8f,-.5f);
+      add("kneeL",.15f,.45f);add("kneeR",-.15f,.45f);
+      add("ankleL",.15f,.9f);add("ankleR",-.15f,.9f);
+      return rig.retarget(QJsonDocument(QJsonObject{{"device","test"},
+          {"t",1.+index/30.},{"tracked",true},
+          {"bodies",QJsonArray{QJsonObject{{"id",1},{"joints",joints}}}}}).toJson());
+    };
+    const QQuaternion initial=frame(0,-.5f).bones[6].localRotation;
+    float quietMax=0;
+    for(int i=1;i<=30;++i) {
+      const auto pose=frame(i,i%2?-.53f:-.47f);
+      const float dot=std::clamp(std::abs(QQuaternion::dotProduct(
+          initial,pose.bones[6].localRotation)),0.f,1.f);
+      if(i>10)quietMax=std::max(quietMax,2.f*std::acos(dot));
+    }
+    const auto moved=frame(31,-.2f);
+    const float movedAngle=2.f*std::acos(std::clamp(std::abs(
+        QQuaternion::dotProduct(initial,moved.bones[6].localRotation)),0.f,1.f));
+    fprintf(stderr,"Rig stability: quiet %.4f rad, moved %.4f rad\n",quietMax,movedAngle);
+    return quietMax<.08f&&movedAngle>.08f?0:2;
   }
   if (app.arguments().contains("--check-mocap-rig")) {
     QJsonObject joints;

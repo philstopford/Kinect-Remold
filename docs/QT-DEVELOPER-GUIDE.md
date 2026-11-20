@@ -112,13 +112,15 @@ Kinect One release test, Core ML was slower than CPU for MoveNet but faster
 for RTMPose Hand. CPU remains the portable default; setting
 `REMOLD_ONNX_HAND_PROVIDER=coreml` selects the measured faster hand path on
 that system. Depth registration bins projected points in
-color-image space before searching for each joint.
+color-image space before searching for each joint. A recent joint depth also
+guides the choice among nearby projected points, reducing foreground/background
+switching at limb edges. Rig rotation smoothing treats very small angular
+changes as measurement noise.
 
-On Linux/Windows, body/hand sessions that previously requested automatic thread
-counts now default to two intra-op threads with spinning disabled. Set
-`REMOLD_ONNX_THREADS=1..16` before startup to override that default. Explicit
-face-session thread counts and the macOS defaults are preserved. Body/hand
-capture drains superseded buffered RGB packets while retaining ordered depth;
+On all platforms, body/hand sessions default to two intra-op threads with
+spinning disabled. Set `REMOLD_ONNX_THREADS=1..16` before startup to override
+that default. Explicit face-session thread counts remain two, with spinning
+disabled. Body and face capture drain superseded buffered RGB packets while retaining ordered depth;
 the packet scanner requires a complete newer RGB frame before skipping work.
 See [the measurements](QT-MULTI-PERSON-MOCAP.md#cpu-use-during-body-fusion).
 

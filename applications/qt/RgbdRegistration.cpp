@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -54,7 +55,8 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
     const DepthCalibrationProfile* calibration,int colorWidth,int colorHeight,
     bool kinectOne,const std::array<BodyKeypoint,17>& body,
     const std::array<std::array<BodyKeypoint,21>,2>& hands,
-    float expectedPersonDepth) {
+    float expectedPersonDepth,
+    const std::array<MetricPoseJoint,jointCount>* previous) {
   std::array<MetricPoseJoint,jointCount> result{};
   if(!camera.valid()||depth.size()!=qsizetype(camera.width)*camera.height*2||
      colorWidth<1||colorHeight<1) return result;
@@ -131,16 +133,26 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
        !std::isfinite(keypoint.y)||keypoint.x<0||keypoint.x>1||
        keypoint.y<0||keypoint.y>1) continue;
     const float targetU=keypoint.x*colorWidth,targetV=keypoint.y*colorHeight;
-    float best=maxDistance*maxDistance;
+    const float priorZ=previous&&(*previous)[i].valid&&
+        (*previous)[i].confidence>=.2f?(*previous)[i].point.z():0.f;
+    const float radiusSquared=maxDistance*maxDistance;
+    auto continuityCost=[&](const ProjectedPoint& p) {
+      const float dz=p.xyz.z()-priorZ;
+      return priorZ>0?1600.f*std::min(dz*dz,.25f):0.f;
+    };
+    float best=std::numeric_limits<float>::infinity();
     const ProjectedPoint* selected=nullptr;
     nearby(targetU,targetV,[&](const ProjectedPoint& p) {
       if(expectedPersonDepth>0&&
          std::abs(p.xyz.z()-expectedPersonDepth)>(i>=16?.9f:i>=12?.35f:i>=10?.55f:.7f))return;
       const float du=p.u-targetU,dv=p.v-targetV,distance=du*du+dv*dv;
-      if(distance<best) {best=distance;selected=&p;}
+      if(distance>=radiusSquared)return;
+      const float score=distance+continuityCost(p);
+      if(score<best) {best=score;selected=&p;}
     });
     if(!selected) continue;
-    const float registrationQuality=std::max(.1f,1-std::sqrt(best)/maxDistance);
+    const float du=selected->u-targetU,dv=selected->v-targetV;
+    const float registrationQuality=std::max(.1f,1-std::sqrt(du*du+dv*dv)/maxDistance);
     result[i]={selected->xyz,keypoint.confidence*registrationQuality,true};
   }
   // Nearest color projection can land on the background at a silhouette edge.
@@ -157,8 +169,10 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
       const float depthRange=i==4||i==5||i==10||i==11?.6f:
           i<=3?.9f:i<=9?.75f:1.2f;
       const float targetU=keypoint.x*colorWidth,targetV=keypoint.y*colorHeight;
-      float best=maxDistance*maxDistance;
-      float bestDistance=best;
+      const float priorZ=previous&&(*previous)[i].valid&&
+          (*previous)[i].confidence>=.2f?(*previous)[i].point.z():0.f;
+      float best=std::numeric_limits<float>::infinity();
+      float bestDistance=maxDistance*maxDistance;
       const ProjectedPoint* selected=nullptr;
       nearby(targetU,targetV,[&](const ProjectedPoint& p) {
         if(expectedPersonDepth>0&&
@@ -166,8 +180,11 @@ std::array<MetricPoseJoint,RgbdRegistration::jointCount> RgbdRegistration::lift(
         if(std::abs(p.xyz.z()-torsoZ)>depthRange)return;
         if(i>=12&&std::abs(p.xyz.z()-torsoZ)>.35f)return;
         const float du=p.u-targetU,dv=p.v-targetV,distance=du*du+dv*dv;
+        if(distance>=maxDistance*maxDistance)return;
+        const float dz=p.xyz.z()-priorZ;
+        const float continuity=priorZ>0?1600.f*std::min(dz*dz,.25f):0.f;
         const float score=distance+(i>=12?2500.f*(p.xyz.z()-torsoZ)*
-            (p.xyz.z()-torsoZ):0.f);
+            (p.xyz.z()-torsoZ):0.f)+continuity;
         if(score<best) {best=score;bestDistance=distance;selected=&p;}
       });
       if(!selected) {result[i]={};continue;}

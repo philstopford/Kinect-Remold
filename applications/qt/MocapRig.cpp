@@ -276,8 +276,12 @@ HumanoidPose MocapRig::retarget(const QByteArray& cameraJson,bool mirror) {
         result.bones[i].confidence>0) {
       const float dt=float(result.time-previousTime_);
       const float dot=std::clamp(std::abs(QQuaternion::dotProduct(previousLocal_[i],local)),0.f,1.f);
-      const float angularSpeed=2.f*std::acos(dot)/dt;
-      float alpha=1.f-std::exp(-dt*(6.f+std::min(angularSpeed,6.f)*.8f));
+      const float angle=2.f*std::acos(dot);
+      // Small direction changes are dominated by depth and hand landmark
+      // noise. Do not interpret them as high angular speed and follow them
+      // more aggressively than deliberate turns.
+      const float angularSpeed=std::max(0.f,angle-.09f)/dt;
+      float alpha=1.f-std::exp(-dt*(3.f+std::min(angularSpeed,4.f)*.8f));
       if(result.bones[i].confidence<.2f)alpha*=.5f;
       local=QQuaternion::slerp(previousLocal_[i],local,alpha).normalized();
     } else if(hasPrevious_&&result.bones[i].confidence==0) local=previousLocal_[i];

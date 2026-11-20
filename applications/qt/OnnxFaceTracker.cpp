@@ -58,6 +58,7 @@ struct OnnxFaceTracker::Impl {
   float cropRoll=0;
   bool hasCrop=false;
   int missed=0;
+  unsigned searchPhase=0;
 };
 
 OnnxFaceTracker::OnnxFaceTracker(const QString& path):impl_(std::make_unique<Impl>()) {
@@ -147,11 +148,9 @@ QJsonObject OnnxFaceTracker::track(const QImage& image,
     std::array<float,1434> measured{};
     float confidence=0,x0=0,y0=0,usedRoll=0;
     auto candidate=[&](float centerX,float centerY,float trialSide,float roll) {
-      // MoveNet's nose/ear/shoulder estimate can contract abruptly during a
-      // head tilt. A smaller fallback crop then becomes the next tracking
-      // anchor and makes the face mesh shrink for many frames. Keep the
-      // current scale until tracking is lost long enough to reset the crop.
-      if(impl_->hasCrop)trialSide=std::max(trialSide,impl_->cropSide);
+      // Resist one-frame MoveNet contractions, but let the tracked crop recover
+      // gradually after a larger reacquisition.
+      if(impl_->hasCrop)trialSide=std::max(trialSide,impl_->cropSide*.94f);
       const float originX=centerX-trialSide*.5f,originY=centerY-trialSide*.5f;
       if(trialSide<45||trialSide>width*.85f||
          originX+trialSide*.75f<0||originX+trialSide*.25f>=width||
@@ -181,39 +180,38 @@ QJsonObject OnnxFaceTracker::track(const QImage& image,
         std::copy_n(values[0].GetTensorData<float>(),1434,measured.begin());
       }
     };
+    constexpr float usablePresence=.65f;
+    const unsigned searchPhase=impl_->searchPhase++;
     if(impl_->hasCrop) {
       candidate(impl_->cropCx,impl_->cropCy,impl_->cropSide,impl_->cropRoll);
-      // Body keypoints can disappear in profile. Search near the last good
-      // crop before falling back to the current body estimate.
-      if(confidence<.55f) {
+      if(confidence<usablePresence&&bodyCropValid)
+        candidate(cx,cy,bodySide,impl_->cropRoll);
+      // Spread the nearby search over frames instead of running four more
+      // model inferences on every missed frame.
+      if(confidence<usablePresence) {
         const float delta=impl_->cropSide*.12f;
-        candidate(impl_->cropCx+delta,impl_->cropCy,impl_->cropSide,impl_->cropRoll);
-        candidate(impl_->cropCx-delta,impl_->cropCy,impl_->cropSide,impl_->cropRoll);
-        candidate(impl_->cropCx,impl_->cropCy+delta,impl_->cropSide,impl_->cropRoll);
-        candidate(impl_->cropCx,impl_->cropCy-delta,impl_->cropSide,impl_->cropRoll);
+        switch(searchPhase%4) {
+        case 0:candidate(impl_->cropCx+delta,impl_->cropCy,impl_->cropSide,impl_->cropRoll);break;
+        case 1:candidate(impl_->cropCx-delta,impl_->cropCy,impl_->cropSide,impl_->cropRoll);break;
+        case 2:candidate(impl_->cropCx,impl_->cropCy+delta,impl_->cropSide,impl_->cropRoll);break;
+        default:candidate(impl_->cropCx,impl_->cropCy-delta,impl_->cropSide,impl_->cropRoll);break;
+        }
       }
-    }
-    if(confidence<.55f&&bodyCropValid) {
+    } else if(bodyCropValid) {
       candidate(cx,cy,bodySide,impl_->cropRoll);
-      if(confidence<.55f) {
-        candidate(cx+bodySide*.1f,cy,bodySide,impl_->cropRoll);
-        candidate(cx-bodySide*.1f,cy,bodySide,impl_->cropRoll);
-      }
-      if(confidence<.55f) {
-        candidate(cx,cy-bodySide*.1f,bodySide,impl_->cropRoll);
-        candidate(cx,cy+bodySide*.1f,bodySide,impl_->cropRoll);
-      }
     }
-    if(confidence<.55f) {
+    if(confidence<usablePresence) {
       // Dedicated facial capture may show only a close face, leaving MoveNet
-      // without usable shoulders or even a nose. Search central face crops.
+      // without usable shoulders or even a nose. Rotate the fallback crop.
       const float trial=std::min(width,height)*.8f;
-      candidate(width*.5f,height*.5f,trial,0);
-      if(confidence<.55f)candidate(width*.5f,height*.5f,trial*.65f,0);
-      if(confidence<.55f)candidate(width*.38f,height*.48f,trial,0);
-      if(confidence<.55f)candidate(width*.62f,height*.48f,trial,0);
+      switch(searchPhase%4) {
+      case 0:candidate(width*.5f,height*.5f,trial,0);break;
+      case 1:candidate(width*.5f,height*.5f,trial*.65f,0);break;
+      case 2:candidate(width*.38f,height*.48f,trial,0);break;
+      default:candidate(width*.62f,height*.48f,trial,0);break;
+      }
     }
-    if(confidence<.55f) {
+    if(confidence<usablePresence) {
       if(++impl_->missed>15) {impl_->hasCrop=false;impl_->cropRoll=0;}
       return {};
     }
